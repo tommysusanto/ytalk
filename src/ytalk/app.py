@@ -119,7 +119,12 @@ def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, statu
     print(f"Summarizing with Ollama model '{model}'...")
     prompt = (
         "You are a helpful assistant. Summarize the following transcript concisely. "
-        "Include the key points and main ideas. Use bullet points.\n\n"
+        "Include the key points and main ideas.\n"
+        "Format rules:\n"
+        "- Use markdown headers (##) for sections\n"
+        "- Use dashes (-) for bullet points, not asterisks\n"
+        "- Keep bullet points short (one or two sentences max)\n"
+        "- Use sub-bullets with indentation where needed\n\n"
         f"TRANSCRIPT:\n{text}\n\n"
         "SUMMARY:"
     )
@@ -208,6 +213,35 @@ def fetch_ollama_models() -> list[str] | None:
         return [m["name"] for m in resp.json().get("models", [])]
     except Exception:
         return None
+
+
+def _markdown_to_rich_markup(text: str) -> str:
+    """Convert markdown text to Rich console markup for display in RichLog."""
+    import re
+    lines = text.splitlines()
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        # Headers
+        if stripped.startswith("### "):
+            out.append(f"  [bold cyan]{stripped[4:]}[/bold cyan]")
+        elif stripped.startswith("## "):
+            out.append(f"\n[bold yellow]{stripped[3:]}[/bold yellow]")
+        elif stripped.startswith("# "):
+            out.append(f"\n[bold magenta]{stripped[2:]}[/bold magenta]")
+        # Bullet points (-, *, •)
+        elif re.match(r"^\s*[-*•]\s", line):
+            indent = len(line) - len(line.lstrip())
+            content = re.sub(r"^[-*•]\s+", "", stripped)
+            content = re.sub(r"\*\*(.+?)\*\*", r"[bold]\1[/bold]", content)
+            prefix = "  " * (indent // 2) + "  •"
+            out.append(f"{prefix} {content}")
+        elif stripped == "---" or stripped == "***":
+            continue
+        else:
+            converted = re.sub(r"\*\*(.+?)\*\*", r"[bold]\1[/bold]", stripped)
+            out.append(converted)
+    return "\n".join(out)
 
 
 WHISPER_MODELS = ["tiny", "base", "small", "base", "large"]
@@ -443,7 +477,7 @@ class YTalkApp(App):
             chat_model = "gemma3:4b"
 
         chat_log = self.query_one("#chat-log", RichLog)
-        self.call_from_thread(chat_log.write, "[bold yellow]Summarizing...[/bold yellow]")
+        self.call_from_thread(chat_log.write, "[dim]Generating summary...[/dim]")
 
         try:
             def _on_summary_token(text):
@@ -458,7 +492,14 @@ class YTalkApp(App):
                 progress_callback=_on_summary_token,
                 status_callback=_on_summary_status,
             )
-            self.call_from_thread(chat_log.write, f"[bold green]Summary:[/bold green]\n{result}")
+            formatted = _markdown_to_rich_markup(result)
+            self.call_from_thread(chat_log.write, "")
+            self.call_from_thread(chat_log.write, "[bold green]───── Summary ─────[/bold green]")
+            self.call_from_thread(chat_log.write, "")
+            for line in formatted.splitlines():
+                self.call_from_thread(chat_log.write, line)
+            self.call_from_thread(chat_log.write, "")
+            self.call_from_thread(chat_log.write, "[bold green]───────────────────[/bold green]")
             self._set_status("Status: Done!")
         except Exception as e:
             self._set_status(f"Error: {e}")
