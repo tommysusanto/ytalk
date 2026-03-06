@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ytalk"
+version = "0.1.0"
+description = "Download a YouTube video, transcribe with Whisper, and chat about it with Ollama"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "openai-whisper",
+    "requests",
+    "yt-dlp",
+    "textual>=0.40",
+]
+
+[project.scripts]
+ytalk = "ytalk.app:entry_point"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ytalk"]
