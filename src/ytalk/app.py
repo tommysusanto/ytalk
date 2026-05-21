@@ -11,33 +11,46 @@ Requirements:
 """
 
 import argparse
+import base64
 import os
+import re
 import sys
 import tempfile
-import time
+import threading
+from datetime import datetime
 
 import requests
 import whisper
 import yt_dlp
+from rich.markup import escape as rich_escape
+from rich.text import Text
 
 from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.widgets import (
     Button,
-    Collapsible,
     Footer,
     Header,
     Input,
     Label,
+    Markdown,
     RichLog,
     Select,
+    Static,
+    TabbedContent,
+    TabPane,
     TextArea,
 )
 
 
-def download_audio(url: str, output_dir: str, progress_callback=None) -> str:
-    """Download audio from YouTube using yt-dlp Python API."""
+def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[str, dict]:
+    """Download audio from YouTube using yt-dlp Python API.
+
+    Returns (audio_file_path, metadata_dict).
+    """
     output_path = os.path.join(output_dir, "audio.%(ext)s")
 
     def _progress_hook(d):
@@ -62,7 +75,15 @@ def download_audio(url: str, output_dir: str, progress_callback=None) -> str:
     }
     print(f"Downloading audio from: {url}")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
         ydl.download([url])
+
+    meta = {
+        "title": info.get("title") or "Unknown title",
+        "channel": info.get("uploader") or info.get("channel") or "Unknown channel",
+        "duration": int(info.get("duration") or 0),
+        "url": url,
+    }
 
     audio_file = os.path.join(output_dir, "audio.mp3")
     if not os.path.exists(audio_file):
@@ -73,7 +94,7 @@ def download_audio(url: str, output_dir: str, progress_callback=None) -> str:
     if not os.path.exists(audio_file):
         raise FileNotFoundError(f"No audio file found in {output_dir}")
     print(f"Audio saved to: {audio_file}")
-    return audio_file
+    return audio_file, meta
 
 
 def transcribe(audio_path: str, whisper_model: str = "base", progress_callback=None) -> str:
@@ -81,7 +102,6 @@ def transcribe(audio_path: str, whisper_model: str = "base", progress_callback=N
     # Prevent tqdm from creating a multiprocessing RLock, which spawns a
     # resource-tracker subprocess and fails with "bad value(s) in fds_to_keep"
     # when called from a Textual worker thread.
-    import threading
     import tqdm.std as tqdm_std
     tqdm_std.TqdmDefaultWriteLock.mp_lock = threading.RLock()
 
@@ -115,7 +135,7 @@ def transcribe(audio_path: str, whisper_model: str = "base", progress_callback=N
 
 
 def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, status_callback=None) -> str:
-    """Summarize text using Ollama's API."""
+    """Summarize text using Ollama's API. progress_callback receives accumulated text."""
     print(f"Summarizing with Ollama model '{model}'...")
     prompt = (
         "You are a helpful assistant. Summarize the following transcript concisely. "
@@ -161,7 +181,9 @@ def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, statu
 
 
 def chat_query(transcript: str, question: str, history: list[dict], model: str, progress_callback=None) -> str:
-    """Answer a question about the transcript using Ollama's chat API."""
+    """Answer a question about the transcript using Ollama's chat API.
+    progress_callback receives (accumulated_text, phase).
+    """
     import json as _json
 
     system_prompt = (
@@ -188,7 +210,6 @@ def chat_query(transcript: str, question: str, history: list[dict], model: str, 
     )
     resp.raise_for_status()
     accumulated = ""
-    token_count = 0
     for line in resp.iter_lines():
         if not line:
             continue
@@ -196,9 +217,8 @@ def chat_query(transcript: str, question: str, history: list[dict], model: str, 
         token = obj.get("message", {}).get("content", "")
         if token:
             accumulated += token
-            token_count += 1
             if progress_callback:
-                progress_callback(token_count, "generating")
+                progress_callback(accumulated, "generating")
     return accumulated.strip()
 
 
@@ -215,36 +235,24 @@ def fetch_ollama_models() -> list[str] | None:
         return None
 
 
-def _markdown_to_rich_markup(text: str) -> str:
-    """Convert markdown text to Rich console markup for display in RichLog."""
-    import re
-    lines = text.splitlines()
-    out = []
-    for line in lines:
-        stripped = line.strip()
-        # Headers
-        if stripped.startswith("### "):
-            out.append(f"  [bold cyan]{stripped[4:]}[/bold cyan]")
-        elif stripped.startswith("## "):
-            out.append(f"\n[bold yellow]{stripped[3:]}[/bold yellow]")
-        elif stripped.startswith("# "):
-            out.append(f"\n[bold magenta]{stripped[2:]}[/bold magenta]")
-        # Bullet points (-, *, •)
-        elif re.match(r"^\s*[-*•]\s", line):
-            indent = len(line) - len(line.lstrip())
-            content = re.sub(r"^[-*•]\s+", "", stripped)
-            content = re.sub(r"\*\*(.+?)\*\*", r"[bold]\1[/bold]", content)
-            prefix = "  " * (indent // 2) + "  •"
-            out.append(f"{prefix} {content}")
-        elif stripped == "---" or stripped == "***":
-            continue
-        else:
-            converted = re.sub(r"\*\*(.+?)\*\*", r"[bold]\1[/bold]", stripped)
-            out.append(converted)
-    return "\n".join(out)
+WHISPER_MODELS = ["tiny", "base", "small", "medium", "large"]
 
 
-WHISPER_MODELS = ["tiny", "base", "small", "base", "large"]
+class ChatTextArea(TextArea):
+    """Multi-line input: Enter submits, Shift+Enter inserts newline."""
+
+    BINDINGS = [Binding("enter", "submit", "Send", show=False, priority=True)]
+
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            self.value = value
+            super().__init__()
+
+    def action_submit(self) -> None:
+        value = self.text.strip()
+        if value:
+            self.text = ""
+            self.post_message(self.Submitted(value))
 
 
 class YTalkApp(App):
@@ -252,9 +260,41 @@ class YTalkApp(App):
     Screen {
         layout: vertical;
     }
+    TabbedContent {
+        height: 1fr;
+    }
+    TabPane {
+        padding: 1 2;
+    }
+    TabbedContent > Tabs {
+        background: $boost;
+    }
+    TabbedContent Tab {
+        color: $text;
+        text-style: bold;
+        padding: 0 3;
+    }
+    TabbedContent Tab.-active {
+        color: $background;
+        background: $accent;
+        text-style: bold;
+    }
+    TabbedContent Tab:hover {
+        color: $accent;
+        background: $surface;
+    }
+    TabbedContent Tab.-active:hover {
+        color: $background;
+        background: $accent;
+    }
+    TabbedContent Underline > .underline--bar {
+        color: $accent;
+        background: $boost;
+    }
+
+    /* Setup */
     #form {
         height: auto;
-        padding: 1 2;
     }
     .form-row {
         height: 3;
@@ -281,93 +321,138 @@ class YTalkApp(App):
         padding: 0 2;
         background: $surface;
     }
-    #output-area {
-        padding: 0 2 1 2;
-        max-height: 25%;
-    }
-    .output-label {
-        margin-top: 1;
-        text-style: bold;
-    }
-    TextArea {
+
+    /* Transcript */
+    #video-meta {
         height: auto;
-        max-height: 12;
+        padding: 0 0 1 0;
+        color: $text-muted;
     }
-    #chat-area {
-        height: 3fr;
-        padding: 0 2;
+    #transcript-actions {
+        height: 3;
+        margin-bottom: 1;
     }
-    #chat-log {
+    #transcript-search {
+        width: 1fr;
+    }
+    #transcript-actions Button {
+        width: 10;
+        margin-left: 1;
+    }
+    #transcript-log {
         height: 1fr;
         border: solid $primary;
     }
+
+    /* Chat */
+    #chat-scroll {
+        height: 1fr;
+        border: solid $primary;
+        padding: 1;
+    }
+    .msg {
+        margin-bottom: 1;
+        padding: 0 1;
+        height: auto;
+    }
+    .msg.user {
+        color: $accent;
+    }
+    .msg.ai.streaming {
+        border-left: thick $warning;
+        padding-left: 1;
+    }
     #chat-input-row {
-        height: 3;
+        height: 6;
         margin-top: 1;
     }
     #chat-input {
         width: 1fr;
-    }
-    #summarize-btn {
-        background: transparent;
-        border: none;
-        text-style: underline;
-        color: $text-muted;
-        height: 1;
-        min-width: 12;
-        padding: 0;
-    }
-    #summarize-btn:hover {
-        color: $accent;
-        background: transparent;
-    }
-    #summarize-btn:focus {
-        background: transparent;
-    }
-    #summarize-btn.hidden {
-        display: none;
+        height: 6;
     }
     #send-btn {
-        width: 12;
+        width: 10;
+        height: 6;
+        margin-left: 1;
+    }
+
+    /* Summary */
+    #summary-actions {
+        height: 3;
+        margin-bottom: 1;
+    }
+    #summary-actions Button {
+        margin-right: 1;
+    }
+    #summary-md {
+        height: 1fr;
+        border: solid $primary;
+        padding: 1;
     }
     """
 
     TITLE = "yTalk"
+    ENABLE_COMMAND_PALETTE = False
+
+    BINDINGS = [
+        Binding("ctrl+s", "show_setup", "⚙ Settings", show=True),
+        Binding("ctrl+t", "cycle_tab", "↹ Tabs", show=True),
+        Binding("ctrl+q", "quit", "⏻ Quit", show=True),
+    ]
 
     _transcript: str = ""
+    _summary: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical(id="form"):
-            with Horizontal(classes="form-row"):
-                yield Label("YouTube URL:")
-                yield Input(placeholder="https://www.youtube.com/watch?v=...", id="url-input")
-            with Horizontal(classes="form-row"):
-                yield Label("Whisper Model:")
-                yield Select(
-                    [(m, m) for m in WHISPER_MODELS],
-                    value="base",
-                    id="whisper-select",
-                )
-            with Horizontal(classes="form-row"):
-                yield Label("Chat Model:")
-                yield Select([], id="chat-select")
-            with Horizontal(id="btn-row"):
-                yield Button("Run", variant="primary", id="run-btn")
-        yield Label("Status: Idle", id="status-bar")
-        with VerticalScroll(id="output-area"):
-            with Collapsible(title="Transcript", id="transcript-section", collapsed=True):
-                yield TextArea(read_only=True, id="transcript-area")
-        with Vertical(id="chat-area"):
-            yield Button("Summarize", id="summarize-btn", classes="hidden")
-            yield RichLog(id="chat-log", wrap=True, markup=True)
-            with Horizontal(id="chat-input-row"):
-                yield Input(placeholder="Ask about the video...", id="chat-input")
-                yield Button("Send", id="send-btn", variant="primary", disabled=True)
+        with TabbedContent(id="tabs", initial="tab-setup"):
+            with TabPane("⚙ Setup", id="tab-setup"):
+                with Vertical(id="form"):
+                    with Horizontal(classes="form-row"):
+                        yield Label("YouTube URL:")
+                        yield Input(placeholder="https://www.youtube.com/watch?v=...", id="url-input")
+                    with Horizontal(classes="form-row"):
+                        yield Label("Whisper Model:")
+                        yield Select(
+                            [(m, m) for m in WHISPER_MODELS],
+                            value="base",
+                            id="whisper-select",
+                        )
+                    with Horizontal(classes="form-row"):
+                        yield Label("Chat Model:")
+                        yield Select([], id="chat-select")
+                    with Horizontal(id="btn-row"):
+                        yield Button("Run", variant="primary", id="run-btn")
+                yield Label("Status: Idle", id="status-bar")
+            with TabPane("Transcript", id="tab-transcript"):
+                yield Static("No video loaded yet.", id="video-meta", markup=True)
+                with Horizontal(id="transcript-actions"):
+                    yield Input(placeholder="Search transcript…", id="transcript-search")
+                    yield Button("Copy", id="transcript-copy", disabled=True)
+                    yield Button("Save", id="transcript-save", disabled=True)
+                yield RichLog(id="transcript-log", wrap=True, markup=True, highlight=False)
+            with TabPane("Chat", id="tab-chat"):
+                yield VerticalScroll(id="chat-scroll")
+                with Horizontal(id="chat-input-row"):
+                    yield ChatTextArea(id="chat-input")
+                    yield Button("Send", id="send-btn", variant="primary", disabled=True)
+            with TabPane("Summary", id="tab-summary"):
+                with Horizontal(id="summary-actions"):
+                    yield Button("Generate", id="summarize-btn", variant="primary", disabled=True)
+                    yield Button("Copy", id="summary-copy", disabled=True)
+                    yield Button("Save", id="summary-save", disabled=True)
+                yield Markdown("", id="summary-md")
         yield Footer()
 
     def on_mount(self) -> None:
         self._chat_history: list[dict] = []
+        self._streaming_msg: Markdown | None = None
+        self._streaming_buf: str = ""
+        self._stream_lock = threading.Lock()
+        self._stream_handle = None
+        self._summary_buf: str = ""
+        self._summary_lock = threading.Lock()
+        self._summary_flush_handle = None
         self._load_ollama_models()
 
     @work(thread=True)
@@ -403,17 +488,49 @@ class YTalkApp(App):
             self.call_from_thread(setattr, chat_select, "value", chat_default)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run-btn":
+        bid = event.button.id
+        if bid == "run-btn":
             self._run_pipeline()
-        elif event.button.id == "send-btn":
-            self._send_chat()
-        elif event.button.id == "summarize-btn":
+        elif bid == "send-btn":
+            self._send_from_input()
+        elif bid == "summarize-btn":
             if self._transcript:
                 self._run_summarize()
+        elif bid == "transcript-copy" and self._transcript:
+            self._copy_to_clipboard(self._transcript, "Transcript")
+        elif bid == "transcript-save" and self._transcript:
+            self._save_to_file("transcript", self._transcript)
+        elif bid == "summary-copy" and self._summary:
+            self._copy_to_clipboard(self._summary, "Summary")
+        elif bid == "summary-save" and self._summary:
+            self._save_to_file("summary", self._summary)
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "chat-input" and not self.query_one("#send-btn", Button).disabled:
-            self._send_chat()
+    def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
+        if not self.query_one("#send-btn", Button).disabled:
+            self._send_chat(event.value)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "transcript-search":
+            self._render_transcript(event.value)
+
+    def action_show_setup(self) -> None:
+        self.query_one(TabbedContent).active = "tab-setup"
+
+    def action_cycle_tab(self) -> None:
+        tabs = self.query_one(TabbedContent)
+        order = ["tab-setup", "tab-transcript", "tab-chat", "tab-summary"]
+        try:
+            idx = order.index(tabs.active)
+        except ValueError:
+            idx = 0
+        tabs.active = order[(idx + 1) % len(order)]
+
+    def _send_from_input(self) -> None:
+        chat_input = self.query_one("#chat-input", ChatTextArea)
+        value = chat_input.text.strip()
+        if value:
+            chat_input.text = ""
+            self._send_chat(value)
 
     @work(thread=True)
     def _run_pipeline(self) -> None:
@@ -423,41 +540,70 @@ class YTalkApp(App):
             return
 
         whisper_model = self.query_one("#whisper-select", Select).value
-
         if whisper_model is Select.BLANK:
             whisper_model = "base"
 
         btn = self.query_one("#run-btn", Button)
         send_btn = self.query_one("#send-btn", Button)
+        summarize_btn = self.query_one("#summarize-btn", Button)
+        transcript_copy = self.query_one("#transcript-copy", Button)
+        transcript_save = self.query_one("#transcript-save", Button)
+        summary_copy = self.query_one("#summary-copy", Button)
+        summary_save = self.query_one("#summary-save", Button)
+
         self.call_from_thread(setattr, btn, "disabled", True)
         self.call_from_thread(setattr, send_btn, "disabled", True)
+        self.call_from_thread(setattr, summarize_btn, "disabled", True)
+        self.call_from_thread(setattr, transcript_copy, "disabled", True)
+        self.call_from_thread(setattr, transcript_save, "disabled", True)
+        self.call_from_thread(setattr, summary_copy, "disabled", True)
+        self.call_from_thread(setattr, summary_save, "disabled", True)
 
-        # Reset chat state for new pipeline run
+        # Reset state
         self._transcript = ""
+        self._summary = ""
         self._chat_history = []
-        chat_log = self.query_one("#chat-log", RichLog)
-        self.call_from_thread(chat_log.clear)
+
+        chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
+
+        def _clear_chat():
+            for child in list(chat_scroll.children):
+                child.remove()
+
+        self.call_from_thread(_clear_chat)
+        self.call_from_thread(self.query_one("#summary-md", Markdown).update, "")
+        self.call_from_thread(self.query_one("#video-meta", Static).update, "Loading…")
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                # Download
                 self._set_status("Status: Downloading audio...")
-                audio_path = download_audio(url, tmpdir, progress_callback=self._set_status)
+                audio_path, meta = download_audio(url, tmpdir, progress_callback=self._set_status)
 
-                # Transcribe
+                mins, secs = divmod(meta["duration"], 60)
+                meta_text = (
+                    f"[b]{rich_escape(meta['title'])}[/b]\n"
+                    f"{rich_escape(meta['channel'])}  •  {mins}:{secs:02d}"
+                )
+                self.call_from_thread(self.query_one("#video-meta", Static).update, meta_text)
+
                 self._set_status("Status: Transcribing with Whisper...")
                 transcript = transcribe(audio_path, whisper_model, progress_callback=self._set_status)
-
-                # Remove the downloaded audio file to free disk space
                 os.remove(audio_path)
 
                 self._transcript = transcript
-                self._set_text("#transcript-area", transcript)
-                self.call_from_thread(setattr, send_btn, "disabled", False)
-                summarize_link = self.query_one("#summarize-btn", Button)
-                self.call_from_thread(summarize_link.remove_class, "hidden")
+                self.call_from_thread(self._render_transcript, "")
 
-            self._set_status("Status: Done! You can now chat about the video.")
+                self.call_from_thread(setattr, summarize_btn, "disabled", False)
+                self.call_from_thread(setattr, transcript_copy, "disabled", False)
+                self.call_from_thread(setattr, transcript_save, "disabled", False)
+
+            self._set_status("Status: Done! Switching to Chat…")
+
+            def _switch_to_chat():
+                self.query_one(TabbedContent).active = "tab-chat"
+                self.query_one("#chat-input").focus()
+
+            self.call_from_thread(_switch_to_chat)
         except Exception as e:
             self._set_status(f"Error: {e}")
         finally:
@@ -467,54 +613,84 @@ class YTalkApp(App):
 
     @work(thread=True)
     def _run_summarize(self) -> None:
-        send_btn = self.query_one("#send-btn", Button)
-        self.call_from_thread(setattr, send_btn, "disabled", True)
-        summarize_link = self.query_one("#summarize-btn", Button)
-        self.call_from_thread(summarize_link.add_class, "hidden")
+        summarize_btn = self.query_one("#summarize-btn", Button)
+        copy_btn = self.query_one("#summary-copy", Button)
+        save_btn = self.query_one("#summary-save", Button)
+        self.call_from_thread(setattr, summarize_btn, "disabled", True)
+        self.call_from_thread(setattr, copy_btn, "disabled", True)
+        self.call_from_thread(setattr, save_btn, "disabled", True)
+
+        def _switch_to_summary():
+            self.query_one(TabbedContent).active = "tab-summary"
+
+        self.call_from_thread(_switch_to_summary)
 
         chat_model = self.query_one("#chat-select", Select).value
         if chat_model is Select.BLANK:
             chat_model = "gemma3:4b"
 
-        chat_log = self.query_one("#chat-log", RichLog)
-        self.call_from_thread(chat_log.write, "[dim]Generating summary...[/dim]")
+        summary_md = self.query_one("#summary-md", Markdown)
+        self.call_from_thread(summary_md.update, "*Generating summary…*")
+
+        with self._summary_lock:
+            self._summary_buf = ""
+
+        def _start_flush():
+            self._summary_flush_handle = self.set_interval(0.05, self._flush_summary)
+
+        self.call_from_thread(_start_flush)
 
         try:
             def _on_summary_token(text):
-                pass
+                with self._summary_lock:
+                    self._summary_buf = text
+
             def _on_summary_status(phase):
                 if phase == "thinking":
-                    self._set_status(f"Status: {chat_model} is thinking...")
+                    self._set_status(f"Status: {chat_model} is thinking…")
                 else:
-                    self._set_status(f"Status: {chat_model} is generating summary...")
+                    self._set_status(f"Status: {chat_model} is generating summary…")
+
             result = summarize(
                 self._transcript, chat_model,
                 progress_callback=_on_summary_token,
                 status_callback=_on_summary_status,
             )
-            formatted = _markdown_to_rich_markup(result)
-            self.call_from_thread(chat_log.write, "")
-            self.call_from_thread(chat_log.write, "[bold green]───── Summary ─────[/bold green]")
-            self.call_from_thread(chat_log.write, "")
-            for line in formatted.splitlines():
-                self.call_from_thread(chat_log.write, line)
-            self.call_from_thread(chat_log.write, "")
-            self.call_from_thread(chat_log.write, "[bold green]───────────────────[/bold green]")
-            self._set_status("Status: Done!")
+            self._summary = result.strip()
+            self.call_from_thread(self._flush_summary)
+            self.call_from_thread(summary_md.update, self._summary)
+            self._set_status("Status: Summary ready!")
         except Exception as e:
             self._set_status(f"Error: {e}")
         finally:
-            self.call_from_thread(summarize_link.remove_class, "hidden")
-            self.call_from_thread(setattr, send_btn, "disabled", False)
+            if self._summary_flush_handle is not None:
+                handle = self._summary_flush_handle
+                self._summary_flush_handle = None
+                self.call_from_thread(handle.stop)
+            self.call_from_thread(setattr, summarize_btn, "disabled", False)
+            if self._summary:
+                self.call_from_thread(setattr, copy_btn, "disabled", False)
+                self.call_from_thread(setattr, save_btn, "disabled", False)
 
-    def _send_chat(self) -> None:
-        chat_input = self.query_one("#chat-input", Input)
-        question = chat_input.value.strip()
-        if not question:
-            return
-        chat_input.value = ""
-        chat_log = self.query_one("#chat-log", RichLog)
-        chat_log.write(f"[bold cyan]You:[/bold cyan] {question}")
+    def _flush_summary(self) -> None:
+        with self._summary_lock:
+            buf = self._summary_buf
+        if buf:
+            self.query_one("#summary-md", Markdown).update(buf)
+
+    def _send_chat(self, question: str) -> None:
+        chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
+        user_msg = Static(
+            f"[bold cyan]You:[/] {rich_escape(question)}",
+            markup=True,
+            classes="msg user",
+        )
+        chat_scroll.mount(user_msg)
+        ai_msg = Markdown("", classes="msg ai")
+        ai_msg.add_class("streaming")
+        chat_scroll.mount(ai_msg)
+        chat_scroll.scroll_end(animate=False)
+        self._streaming_msg = ai_msg
         self._chat_history.append({"role": "user", "content": question})
         self._run_chat_query(question)
 
@@ -522,49 +698,121 @@ class YTalkApp(App):
     def _run_chat_query(self, question: str) -> None:
         send_btn = self.query_one("#send-btn", Button)
         self.call_from_thread(setattr, send_btn, "disabled", True)
-        self._set_status("Status: Thinking...")
+        self._set_status("Status: Thinking…")
 
         chat_model = self.query_one("#chat-select", Select).value
         if chat_model is Select.BLANK:
             chat_model = "gemma3:4b"
 
-        chat_log = self.query_one("#chat-log", RichLog)
-        self.call_from_thread(chat_log.write, "[dim]Generating response...[/dim]")
+        with self._stream_lock:
+            self._streaming_buf = ""
+
+        def _start_flush():
+            self._stream_handle = self.set_interval(0.05, self._flush_stream)
+
+        self.call_from_thread(_start_flush)
 
         try:
-            last_chat_update = [0.0]
-            def _on_chat_token(n, phase):
-                now = time.monotonic()
-                if now - last_chat_update[0] >= 0.15:
-                    last_chat_update[0] = now
-                    self._set_status(f"Status: Generating response... ({n} tokens)")
+            def _on_chat_token(text, phase):
+                with self._stream_lock:
+                    self._streaming_buf = text
+
             answer = chat_query(
                 self._transcript, question, self._chat_history[:-1], chat_model,
                 progress_callback=_on_chat_token,
             )
             self._chat_history.append({"role": "assistant", "content": answer})
-            self.call_from_thread(chat_log.write, f"[bold green]AI:[/bold green] {answer}")
-            self._set_status("Status: Done! You can now chat about the video.")
+            self.call_from_thread(self._flush_stream)
+            if self._streaming_msg is not None:
+                msg = self._streaming_msg
+                self.call_from_thread(msg.update, answer)
+                self.call_from_thread(msg.remove_class, "streaming")
+            self._set_status("Status: Done! Ask another question.")
         except Exception as e:
             self._set_status(f"Error: {e}")
         finally:
+            if self._stream_handle is not None:
+                handle = self._stream_handle
+                self._stream_handle = None
+                self.call_from_thread(handle.stop)
             self.call_from_thread(setattr, send_btn, "disabled", False)
+
+    def _flush_stream(self) -> None:
+        if self._streaming_msg is None:
+            return
+        with self._stream_lock:
+            buf = self._streaming_buf
+        if not buf:
+            return
+        self._streaming_msg.update(buf)
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        # Follow if user is at or near the bottom
+        if scroll.scroll_y >= scroll.max_scroll_y - 2:
+            scroll.scroll_end(animate=False)
+
+    def _render_transcript(self, query: str = "") -> None:
+        log = self.query_one("#transcript-log", RichLog)
+        log.clear()
+        text = self._transcript
+        if not text:
+            return
+        if not query:
+            log.write(text)
+            return
+        rich_text = Text()
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+        last = 0
+        count = 0
+        for m in pattern.finditer(text):
+            rich_text.append(text[last:m.start()])
+            rich_text.append(text[m.start():m.end()], style="reverse yellow")
+            last = m.end()
+            count += 1
+        rich_text.append(text[last:])
+        log.write(rich_text)
+        label = "match" if count == 1 else "matches"
+        self.query_one("#status-bar", Label).update(
+            f"Status: {count} {label} for '{query}'"
+        )
+
+    def _copy_to_clipboard(self, text: str, label: str) -> None:
+        copied = False
+        try:
+            self.copy_to_clipboard(text)
+            copied = True
+        except AttributeError:
+            try:
+                b64 = base64.b64encode(text.encode()).decode()
+                sys.stdout.write(f"\x1b]52;c;{b64}\x07")
+                sys.stdout.flush()
+                copied = True
+            except Exception:
+                copied = False
+        msg = f"Status: {label} copied to clipboard" if copied else f"Status: Copy failed"
+        self.query_one("#status-bar", Label).update(msg)
+
+    @work(thread=True)
+    def _save_to_file(self, kind: str, text: str) -> None:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.expanduser(f"~/ytalk-{kind}-{ts}.txt")
+        try:
+            with open(path, "w") as f:
+                f.write(text)
+            self._set_status(f"Status: Saved to {path}")
+        except Exception as e:
+            self._set_status(f"Error saving: {e}")
 
     def _set_status(self, text: str) -> None:
         label = self.query_one("#status-bar", Label)
         self.call_from_thread(label.update, text)
-
-    def _set_text(self, selector: str, text: str) -> None:
-        area = self.query_one(selector, TextArea)
-        self.call_from_thread(setattr, area, "text", text)
 
 
 def main():
     parser = argparse.ArgumentParser(description="YouTube → Transcribe → Summarize")
     parser.add_argument("url", help="YouTube video URL")
     parser.add_argument("--whisper-model", default="base",
-                        choices=["tiny", "base", "small", "base", "large"],
-                        help="Whisper model size (default: medium)")
+                        choices=["tiny", "base", "small", "medium", "large"],
+                        help="Whisper model size (default: base)")
     parser.add_argument("--ollama-model", default="gemma3:4b",
                         help="Ollama model for summarization (default: gemma3:4b)")
     parser.add_argument("--output", "-o", default=None,
@@ -573,7 +821,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Step 1: Download
-        audio_path = download_audio(args.url, tmpdir)
+        audio_path, _meta = download_audio(args.url, tmpdir)
 
         # Step 2: Transcribe
         transcript = transcribe(audio_path, args.whisper_model)

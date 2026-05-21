@@ -8,7 +8,7 @@ Default URL is a short video for quick testing.
 import asyncio
 import sys
 from ytalk.app import YTalkApp
-from textual.widgets import Button, Label, TextArea, Input
+from textual.widgets import Button, Label, Input
 
 DEFAULT_URL = "https://www.youtube.com/watch?v=DHc1U045o9E"
 
@@ -33,7 +33,7 @@ async def main():
             await asyncio.sleep(0.5)
 
             status = str(app.query_one("#status-bar", Label).render())
-            transcript_len = len(app.query_one("#transcript-area", TextArea).text)
+            transcript_len = len(app._transcript)
             send_enabled = not send_btn.disabled
 
             if status != prev_status:
