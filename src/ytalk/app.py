@@ -319,6 +319,16 @@ class YTalkApp(App):
         color: $background;
         background: $accent;
     }
+    TabbedContent Tab:disabled {
+        color: $text-muted 30%;
+        text-style: dim;
+        background: $boost;
+    }
+    TabbedContent Tab:disabled:hover {
+        color: $text-muted 30%;
+        background: $boost;
+        text-style: dim;
+    }
     TabbedContent Underline > .underline--bar {
         color: $accent;
         background: $boost;
@@ -459,19 +469,19 @@ class YTalkApp(App):
                         yield Select([], id="chat-select")
                     with Horizontal(id="btn-row"):
                         yield Button("Run", variant="primary", id="run-btn")
-            with TabPane("Transcript", id="tab-transcript", disabled=True):
+            with TabPane("🔒 Transcript", id="tab-transcript", disabled=True):
                 yield Static("No video loaded yet.", id="video-meta", markup=True)
                 with Horizontal(id="transcript-actions"):
                     yield Input(placeholder="Search transcript…", id="transcript-search")
                     yield Button("Copy", id="transcript-copy", disabled=True)
                     yield Button("Save", id="transcript-save", disabled=True)
                 yield RichLog(id="transcript-log", wrap=True, markup=True, highlight=False)
-            with TabPane("Chat", id="tab-chat", disabled=True):
+            with TabPane("🔒 Chat", id="tab-chat", disabled=True):
                 yield VerticalScroll(id="chat-scroll")
                 with Horizontal(id="chat-input-row"):
                     yield ChatTextArea(id="chat-input")
                     yield Button("Send", id="send-btn", variant="primary", disabled=True)
-            with TabPane("Summary", id="tab-summary", disabled=True):
+            with TabPane("🔒 Summary", id="tab-summary", disabled=True):
                 with Horizontal(id="summary-actions"):
                     yield Button("Generate", id="summarize-btn", variant="primary", disabled=True)
                     yield Button("Copy", id="summary-copy", disabled=True)
@@ -494,6 +504,9 @@ class YTalkApp(App):
         self._thinking_handle = None
         self._thinking_tick = 0
         self._summary_thinking_handle = None
+        tabs = self.query_one(TabbedContent)
+        for tid in ("tab-transcript", "tab-chat", "tab-summary"):
+            tabs.get_tab(tid).tooltip = "Run the pipeline first"
         self._load_ollama_models()
 
     @work(thread=True)
@@ -632,9 +645,15 @@ class YTalkApp(App):
 
             def _open_workspace():
                 tabs = self.query_one(TabbedContent)
-                tabs.enable_tab("tab-transcript")
-                tabs.enable_tab("tab-chat")
-                tabs.enable_tab("tab-summary")
+                for tid, label in (
+                    ("tab-transcript", "Transcript"),
+                    ("tab-chat", "Chat"),
+                    ("tab-summary", "Summary"),
+                ):
+                    tabs.enable_tab(tid)
+                    tab = tabs.get_tab(tid)
+                    tab.label = label
+                    tab.tooltip = None
                 tabs.active = "tab-transcript"
 
             self.call_from_thread(_open_workspace)
