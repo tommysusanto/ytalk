@@ -47,7 +47,7 @@ Everything runs locally on your machine. No API keys, no cloud services, no data
 brew install tommysusanto/tap/ytalk
 ```
 
-This pulls in Python, ffmpeg, Ollama, and PyTorch as dependencies automatically.
+This pulls in Python, ffmpeg, and Ollama as dependencies automatically.
 
 Then start Ollama and pull a chat model:
 
