@@ -33,7 +33,6 @@ from textual.message import Message
 from textual.widgets import (
     Button,
     Footer,
-    Header,
     Input,
     Label,
     Markdown,
@@ -292,6 +291,14 @@ class YTalkApp(App):
     Screen {
         layout: vertical;
     }
+    #app-header {
+        dock: top;
+        height: 4;
+        background: $boost;
+        color: $accent;
+        content-align: center middle;
+        text-style: bold;
+    }
     TabbedContent {
         height: 1fr;
     }
@@ -450,7 +457,7 @@ class YTalkApp(App):
                 break
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Static("yTalk", id="app-header", markup=True)
         with TabbedContent(id="tabs", initial="tab-setup"):
             with TabPane("⚙ Setup", id="tab-setup"):
                 with Vertical(id="form"):
