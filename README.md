@@ -41,27 +41,32 @@ Everything runs locally on your machine. No API keys, no cloud services, no data
 - Multi-turn chat with full conversation history
 - Save transcripts and summaries to file
 
-## Prerequisites
-
-| Dependency | Install |
-|------------|---------|
-| Python 3.11+ | [python.org](https://www.python.org/downloads/) |
-| ffmpeg | `brew install ffmpeg` |
-| Ollama | [ollama.ai](https://ollama.ai) |
-
-After installing Ollama, pull a model:
-
-```bash
-ollama pull gemma3:4b
-```
-
 ## Install
 
 ```bash
-git clone https://github.com/<user>/ytalk.git
+brew install tommysusanto/tap/ytalk
+```
+
+This pulls in Python, ffmpeg, Ollama, and PyTorch as dependencies automatically.
+
+Then start Ollama and pull a chat model:
+
+```bash
+brew services start ollama
+ollama pull gemma3:4b
+```
+
+### Install from source
+
+For development or if you prefer not to use Homebrew:
+
+```bash
+git clone https://github.com/tommysusanto/ytalk.git
 cd ytalk
 pip install -e .
 ```
+
+Requires Python 3.11+, ffmpeg, and Ollama installed separately.
 
 ## Usage
 
