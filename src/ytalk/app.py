@@ -97,8 +97,8 @@ def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[s
     return audio_file, meta
 
 
-def transcribe(audio_path: str, whisper_model: str = "base", progress_callback=None) -> str:
-    """Transcribe audio using OpenAI Whisper."""
+def transcribe(audio_path: str, whisper_model: str = "base", progress_callback=None) -> tuple[str, list[dict]]:
+    """Transcribe audio using OpenAI Whisper. Returns (text, segments)."""
     # Prevent tqdm from creating a multiprocessing RLock, which spawns a
     # resource-tracker subprocess and fails with "bad value(s) in fds_to_keep"
     # when called from a Textual worker thread.
@@ -130,8 +130,40 @@ def transcribe(audio_path: str, whisper_model: str = "base", progress_callback=N
         _tqdm_pkg.tqdm = _OrigTqdm
 
     text = result["text"].strip()
-    print(f"Transcription complete ({len(text)} chars).")
-    return text
+    segments = result.get("segments", []) or []
+    print(f"Transcription complete ({len(text)} chars, {len(segments)} segments).")
+    return text, segments
+
+
+def format_transcript_segments(
+    segments: list[dict],
+    pause_threshold: float = 1.5,
+    max_paragraph_seconds: float = 30.0,
+) -> str:
+    """Group Whisper segments into paragraphs on >pause_threshold pauses or every
+    ~max_paragraph_seconds. Each paragraph is prefixed with [mm:ss] markup."""
+    if not segments:
+        return ""
+    paragraphs: list[tuple[float, str]] = []
+    current_texts: list[str] = [segments[0]["text"].strip()]
+    current_start = segments[0]["start"]
+    last_end = segments[0]["end"]
+    for seg in segments[1:]:
+        gap = seg["start"] - last_end
+        running = seg["start"] - current_start
+        if gap > pause_threshold or running > max_paragraph_seconds:
+            paragraphs.append((current_start, " ".join(current_texts)))
+            current_texts = []
+            current_start = seg["start"]
+        current_texts.append(seg["text"].strip())
+        last_end = seg["end"]
+    if current_texts:
+        paragraphs.append((current_start, " ".join(current_texts)))
+    lines = []
+    for start, text in paragraphs:
+        mm, ss = divmod(int(start), 60)
+        lines.append(f"[{mm:02d}:{ss:02d}] {text}")
+    return "\n\n".join(lines)
 
 
 def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, status_callback=None) -> str:
@@ -392,16 +424,20 @@ class YTalkApp(App):
     """
 
     TITLE = "yTalk"
-    ENABLE_COMMAND_PALETTE = False
-
-    BINDINGS = [
-        Binding("ctrl+s", "show_setup", "⚙ Settings", show=True),
-        Binding("ctrl+t", "cycle_tab", "↹ Tabs", show=True),
-        Binding("ctrl+q", "quit", "⏻ Quit", show=True),
-    ]
 
     _transcript: str = ""
     _summary: str = ""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Rename the auto-registered palette binding from "palette" to "⚙ Settings".
+        # Footer renders it in the right-docked slot; leave show=False to avoid a
+        # duplicate entry in the main bindings strip.
+        for _key, binding in self._bindings:
+            if binding.action in {"command_palette", "app.command_palette"}:
+                object.__setattr__(binding, "description", "⚙ Settings")
+                object.__setattr__(binding, "tooltip", "Open settings")
+                break
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -423,25 +459,25 @@ class YTalkApp(App):
                         yield Select([], id="chat-select")
                     with Horizontal(id="btn-row"):
                         yield Button("Run", variant="primary", id="run-btn")
-                yield Label("Status: Idle", id="status-bar")
-            with TabPane("Transcript", id="tab-transcript"):
+            with TabPane("Transcript", id="tab-transcript", disabled=True):
                 yield Static("No video loaded yet.", id="video-meta", markup=True)
                 with Horizontal(id="transcript-actions"):
                     yield Input(placeholder="Search transcript…", id="transcript-search")
                     yield Button("Copy", id="transcript-copy", disabled=True)
                     yield Button("Save", id="transcript-save", disabled=True)
                 yield RichLog(id="transcript-log", wrap=True, markup=True, highlight=False)
-            with TabPane("Chat", id="tab-chat"):
+            with TabPane("Chat", id="tab-chat", disabled=True):
                 yield VerticalScroll(id="chat-scroll")
                 with Horizontal(id="chat-input-row"):
                     yield ChatTextArea(id="chat-input")
                     yield Button("Send", id="send-btn", variant="primary", disabled=True)
-            with TabPane("Summary", id="tab-summary"):
+            with TabPane("Summary", id="tab-summary", disabled=True):
                 with Horizontal(id="summary-actions"):
                     yield Button("Generate", id="summarize-btn", variant="primary", disabled=True)
                     yield Button("Copy", id="summary-copy", disabled=True)
                     yield Button("Save", id="summary-save", disabled=True)
                 yield Markdown("", id="summary-md")
+        yield Label("Status: Idle", id="status-bar")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -453,6 +489,11 @@ class YTalkApp(App):
         self._summary_buf: str = ""
         self._summary_lock = threading.Lock()
         self._summary_flush_handle = None
+        self._transcript_segments: list[dict] = []
+        self._transcript_formatted: str = ""
+        self._thinking_handle = None
+        self._thinking_tick = 0
+        self._summary_thinking_handle = None
         self._load_ollama_models()
 
     @work(thread=True)
@@ -497,9 +538,9 @@ class YTalkApp(App):
             if self._transcript:
                 self._run_summarize()
         elif bid == "transcript-copy" and self._transcript:
-            self._copy_to_clipboard(self._transcript, "Transcript")
+            self._copy_to_clipboard(self._transcript_formatted or self._transcript, "Transcript")
         elif bid == "transcript-save" and self._transcript:
-            self._save_to_file("transcript", self._transcript)
+            self._save_to_file("transcript", self._transcript_formatted or self._transcript)
         elif bid == "summary-copy" and self._summary:
             self._copy_to_clipboard(self._summary, "Summary")
         elif bid == "summary-save" and self._summary:
@@ -512,18 +553,6 @@ class YTalkApp(App):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "transcript-search":
             self._render_transcript(event.value)
-
-    def action_show_setup(self) -> None:
-        self.query_one(TabbedContent).active = "tab-setup"
-
-    def action_cycle_tab(self) -> None:
-        tabs = self.query_one(TabbedContent)
-        order = ["tab-setup", "tab-transcript", "tab-chat", "tab-summary"]
-        try:
-            idx = order.index(tabs.active)
-        except ValueError:
-            idx = 0
-        tabs.active = order[(idx + 1) % len(order)]
 
     def _send_from_input(self) -> None:
         chat_input = self.query_one("#chat-input", ChatTextArea)
@@ -587,23 +616,28 @@ class YTalkApp(App):
                 self.call_from_thread(self.query_one("#video-meta", Static).update, meta_text)
 
                 self._set_status("Status: Transcribing with Whisper...")
-                transcript = transcribe(audio_path, whisper_model, progress_callback=self._set_status)
+                transcript, segments = transcribe(audio_path, whisper_model, progress_callback=self._set_status)
                 os.remove(audio_path)
 
                 self._transcript = transcript
+                self._transcript_segments = segments
+                self._transcript_formatted = format_transcript_segments(segments) or transcript
                 self.call_from_thread(self._render_transcript, "")
 
                 self.call_from_thread(setattr, summarize_btn, "disabled", False)
                 self.call_from_thread(setattr, transcript_copy, "disabled", False)
                 self.call_from_thread(setattr, transcript_save, "disabled", False)
 
-            self._set_status("Status: Done! Switching to Chat…")
+            self._set_status("Status: Done! Review the transcript.")
 
-            def _switch_to_chat():
-                self.query_one(TabbedContent).active = "tab-chat"
-                self.query_one("#chat-input").focus()
+            def _open_workspace():
+                tabs = self.query_one(TabbedContent)
+                tabs.enable_tab("tab-transcript")
+                tabs.enable_tab("tab-chat")
+                tabs.enable_tab("tab-summary")
+                tabs.active = "tab-transcript"
 
-            self.call_from_thread(_switch_to_chat)
+            self.call_from_thread(_open_workspace)
         except Exception as e:
             self._set_status(f"Error: {e}")
         finally:
@@ -635,10 +669,12 @@ class YTalkApp(App):
         with self._summary_lock:
             self._summary_buf = ""
 
-        def _start_flush():
+        def _start_timers():
             self._summary_flush_handle = self.set_interval(0.05, self._flush_summary)
+            self._thinking_tick = 0
+            self._summary_thinking_handle = self.set_interval(0.4, self._tick_thinking_summary)
 
-        self.call_from_thread(_start_flush)
+        self.call_from_thread(_start_timers)
 
         try:
             def _on_summary_token(text):
@@ -657,12 +693,14 @@ class YTalkApp(App):
                 status_callback=_on_summary_status,
             )
             self._summary = result.strip()
+            self.call_from_thread(self._stop_summary_thinking)
             self.call_from_thread(self._flush_summary)
             self.call_from_thread(summary_md.update, self._summary)
             self._set_status("Status: Summary ready!")
         except Exception as e:
             self._set_status(f"Error: {e}")
         finally:
+            self.call_from_thread(self._stop_summary_thinking)
             if self._summary_flush_handle is not None:
                 handle = self._summary_flush_handle
                 self._summary_flush_handle = None
@@ -678,6 +716,21 @@ class YTalkApp(App):
         if buf:
             self.query_one("#summary-md", Markdown).update(buf)
 
+    def _tick_thinking_summary(self) -> None:
+        with self._summary_lock:
+            has_buf = bool(self._summary_buf)
+        if has_buf:
+            self._stop_summary_thinking()
+            return
+        self._thinking_tick += 1
+        dots = "." * (1 + (self._thinking_tick % 3))
+        self.query_one("#summary-md", Markdown).update(f"*Generating summary{dots}*")
+
+    def _stop_summary_thinking(self) -> None:
+        if self._summary_thinking_handle is not None:
+            self._summary_thinking_handle.stop()
+            self._summary_thinking_handle = None
+
     def _send_chat(self, question: str) -> None:
         chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
         user_msg = Static(
@@ -686,7 +739,7 @@ class YTalkApp(App):
             classes="msg user",
         )
         chat_scroll.mount(user_msg)
-        ai_msg = Markdown("", classes="msg ai")
+        ai_msg = Markdown("*Thinking.*", classes="msg ai")
         ai_msg.add_class("streaming")
         chat_scroll.mount(ai_msg)
         chat_scroll.scroll_end(animate=False)
@@ -707,10 +760,12 @@ class YTalkApp(App):
         with self._stream_lock:
             self._streaming_buf = ""
 
-        def _start_flush():
+        def _start_timers():
             self._stream_handle = self.set_interval(0.05, self._flush_stream)
+            self._thinking_tick = 0
+            self._thinking_handle = self.set_interval(0.4, self._tick_thinking)
 
-        self.call_from_thread(_start_flush)
+        self.call_from_thread(_start_timers)
 
         try:
             def _on_chat_token(text, phase):
@@ -722,6 +777,7 @@ class YTalkApp(App):
                 progress_callback=_on_chat_token,
             )
             self._chat_history.append({"role": "assistant", "content": answer})
+            self.call_from_thread(self._stop_thinking)
             self.call_from_thread(self._flush_stream)
             if self._streaming_msg is not None:
                 msg = self._streaming_msg
@@ -731,6 +787,7 @@ class YTalkApp(App):
         except Exception as e:
             self._set_status(f"Error: {e}")
         finally:
+            self.call_from_thread(self._stop_thinking)
             if self._stream_handle is not None:
                 handle = self._stream_handle
                 self._stream_handle = None
@@ -750,30 +807,63 @@ class YTalkApp(App):
         if scroll.scroll_y >= scroll.max_scroll_y - 2:
             scroll.scroll_end(animate=False)
 
+    def _tick_thinking(self) -> None:
+        if self._streaming_msg is None:
+            self._stop_thinking()
+            return
+        with self._stream_lock:
+            has_buf = bool(self._streaming_buf)
+        if has_buf:
+            self._stop_thinking()
+            return
+        self._thinking_tick += 1
+        dots = "." * (1 + (self._thinking_tick % 3))
+        self._streaming_msg.update(f"*Thinking{dots}*")
+
+    def _stop_thinking(self) -> None:
+        if self._thinking_handle is not None:
+            self._thinking_handle.stop()
+            self._thinking_handle = None
+
+    _TIMESTAMP_RE = re.compile(r"^(\[\d{2}:\d{2}\])(\s+)")
+
     def _render_transcript(self, query: str = "") -> None:
         log = self.query_one("#transcript-log", RichLog)
         log.clear()
-        text = self._transcript
+        text = self._transcript_formatted or self._transcript
         if not text:
             return
-        if not query:
-            log.write(text)
-            return
-        rich_text = Text()
-        pattern = re.compile(re.escape(query), re.IGNORECASE)
-        last = 0
-        count = 0
-        for m in pattern.finditer(text):
-            rich_text.append(text[last:m.start()])
-            rich_text.append(text[m.start():m.end()], style="reverse yellow")
-            last = m.end()
-            count += 1
-        rich_text.append(text[last:])
-        log.write(rich_text)
-        label = "match" if count == 1 else "matches"
-        self.query_one("#status-bar", Label).update(
-            f"Status: {count} {label} for '{query}'"
-        )
+        pattern = re.compile(re.escape(query), re.IGNORECASE) if query else None
+        total_matches = 0
+        paragraphs = text.split("\n\n")
+        for i, paragraph in enumerate(paragraphs):
+            rich_text = Text()
+            ts_match = self._TIMESTAMP_RE.match(paragraph)
+            if ts_match:
+                rich_text.append(ts_match.group(1), style="bold cyan")
+                rich_text.append(ts_match.group(2))
+                body_start = ts_match.end()
+            else:
+                body_start = 0
+            body = paragraph[body_start:]
+            if pattern is None:
+                rich_text.append(body)
+            else:
+                last = 0
+                for m in pattern.finditer(body):
+                    rich_text.append(body[last:m.start()])
+                    rich_text.append(body[m.start():m.end()], style="reverse yellow")
+                    last = m.end()
+                    total_matches += 1
+                rich_text.append(body[last:])
+            log.write(rich_text)
+            if i < len(paragraphs) - 1:
+                log.write("")
+        if pattern is not None:
+            label = "match" if total_matches == 1 else "matches"
+            self.query_one("#status-bar", Label).update(
+                f"Status: {total_matches} {label} for '{query}'"
+            )
 
     def _copy_to_clipboard(self, text: str, label: str) -> None:
         copied = False
@@ -824,7 +914,7 @@ def main():
         audio_path, _meta = download_audio(args.url, tmpdir)
 
         # Step 2: Transcribe
-        transcript = transcribe(audio_path, args.whisper_model)
+        transcript, _segments = transcribe(audio_path, args.whisper_model)
         os.remove(audio_path)
 
         print("\n" + "=" * 60)
