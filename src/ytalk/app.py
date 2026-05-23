@@ -12,12 +12,15 @@ Requirements:
 
 import argparse
 import base64
+import logging
 import os
 import re
 import sys
 import tempfile
 import threading
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import requests
 import whisper
@@ -43,6 +46,37 @@ from textual.widgets import (
     TabPane,
     TextArea,
 )
+
+
+LOG_PATH = Path.home() / ".cache" / "ytalk" / "ytalk.log"
+
+
+def _init_logger() -> logging.Logger:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    log = logging.getLogger("ytalk")
+    if log.handlers:
+        return log
+    log.setLevel(logging.INFO)
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        from importlib.metadata import version as _pkg_version
+        ytalk_version = _pkg_version("ytalk")
+    except Exception:
+        ytalk_version = "unknown"
+    log.info(
+        "ytalk session start: version=%s python=%s",
+        ytalk_version,
+        sys.version.split()[0],
+    )
+    return log
+
+
+logger = _init_logger()
 
 
 def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[str, dict]:
@@ -182,7 +216,7 @@ def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, statu
     resp = requests.post(
         "http://localhost:11434/api/generate",
         json={"model": model, "prompt": prompt, "stream": True},
-        timeout=300,
+        timeout=(10, None),
         stream=True,
     )
     resp.raise_for_status()
@@ -236,7 +270,7 @@ def chat_query(transcript: str, question: str, history: list[dict], model: str, 
             "think": False,
             "options": {"num_predict": -1},
         },
-        timeout=300,
+        timeout=(10, None),
         stream=True,
     )
     resp.raise_for_status()
@@ -626,7 +660,9 @@ class YTalkApp(App):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 self._set_status("Status: Downloading audio...")
+                logger.info("pipeline: download start url=%s", url)
                 audio_path, meta = download_audio(url, tmpdir, progress_callback=self._set_status)
+                logger.info("pipeline: download done duration=%ss", meta.get("duration"))
 
                 mins, secs = divmod(meta["duration"], 60)
                 meta_text = (
@@ -636,7 +672,9 @@ class YTalkApp(App):
                 self.call_from_thread(self.query_one("#video-meta", Static).update, meta_text)
 
                 self._set_status("Status: Transcribing with Whisper...")
+                logger.info("pipeline: transcribe start model=%s", whisper_model)
                 transcript, segments = transcribe(audio_path, whisper_model, progress_callback=self._set_status)
+                logger.info("pipeline: transcribe done chars=%d segments=%d", len(transcript), len(segments))
                 os.remove(audio_path)
 
                 self._transcript = transcript
@@ -665,7 +703,7 @@ class YTalkApp(App):
 
             self.call_from_thread(_open_workspace)
         except Exception as e:
-            self._set_status(f"Error: {e}")
+            self._report_error("download/transcribe", e)
         finally:
             self.call_from_thread(setattr, btn, "disabled", False)
             if self._transcript:
@@ -724,7 +762,7 @@ class YTalkApp(App):
             self.call_from_thread(summary_md.update, self._summary)
             self._set_status("Status: Summary ready!")
         except Exception as e:
-            self._set_status(f"Error: {e}")
+            self._report_error("summarize", e)
         finally:
             self.call_from_thread(self._stop_summary_thinking)
             if self._summary_flush_handle is not None:
@@ -811,7 +849,7 @@ class YTalkApp(App):
                 self.call_from_thread(msg.remove_class, "streaming")
             self._set_status("Status: Done! Ask another question.")
         except Exception as e:
-            self._set_status(f"Error: {e}")
+            self._report_error("chat", e)
         finally:
             self.call_from_thread(self._stop_thinking)
             if self._stream_handle is not None:
@@ -921,6 +959,12 @@ class YTalkApp(App):
     def _set_status(self, text: str) -> None:
         label = self.query_one("#status-bar", Label)
         self.call_from_thread(label.update, text)
+
+    def _report_error(self, where: str, exc: BaseException) -> None:
+        logger.exception("%s failed", where)
+        self._set_status(
+            f"Error in {where}: {type(exc).__name__}: {exc}  (see {LOG_PATH})"
+        )
 
 
 def main():

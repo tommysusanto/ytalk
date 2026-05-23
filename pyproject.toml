@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ytalk"
-version = "0.2.1"
+version = "0.2.2"
 description = "Download a YouTube video, transcribe with Whisper, and chat about it with Ollama"
 requires-python = ">=3.11"
 license = "MIT"
