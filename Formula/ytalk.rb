@@ -3,8 +3,8 @@ class Ytalk < Formula
 
   desc "Download YouTube videos, transcribe with Whisper, and chat with Ollama"
   homepage "https://github.com/tommysusanto/ytalk"
-  url "https://github.com/tommysusanto/ytalk/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "f033f611211f23089432d783f40575f33ecdf77ac72adb6b2ba4d6510d943341"
+  url "https://github.com/tommysusanto/ytalk/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "bf1c6ba24b69ceec12d4b0e38e2e7422e4a6554a15290c295c54001414c37fd1"
   license "MIT"
 
   depends_on "ffmpeg"
@@ -231,6 +231,11 @@ class Ytalk < Formula
   end
 
   def post_install
+    Dir.glob(libexec/"lib/python*/site-packages/**/*.so").each do |so|
+      next if File.symlink?(so)
+      system "install_name_tool", "-id", "@rpath/#{File.basename(so)}", so
+      system "codesign", "--force", "--sign", "-", so
+    end
     ohai "Run 'ollama pull gemma3:4b' to download a chat model"
   end
 
