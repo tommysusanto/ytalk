@@ -13,16 +13,6 @@
 
 ---
 
-<!-- TODO: Replace with actual screenshots. Capture with:
-     1. Run `ytalk` and resize terminal to ~120x35
-     2. Screenshot the idle TUI:              assets/tui-idle.png
-     3. Paste a URL, run pipeline, screenshot: assets/tui-processing.png
-     4. After transcript + chat, screenshot:   assets/tui-chat.png
-     Use macOS Cmd+Shift+4 or a tool like CleanShot X.
--->
-
-![yTalk TUI](assets/tui-chat.png)
-
 ## What it does
 
 1. **Downloads** audio from any YouTube video (via yt-dlp)
@@ -81,8 +71,6 @@ ytalk
 1. Paste a YouTube URL
 2. Pick a Whisper model size and chat model
 3. Click **Run** — watch it download, transcribe, then chat
-
-![TUI Pipeline](assets/tui-processing.png)
 
 ### CLI Mode
 

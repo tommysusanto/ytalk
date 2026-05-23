@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BREW_PY="/usr/local/Cellar/ytalk/0.1.0/libexec/bin/python3.12"
+BREW_PY="$(ls -d /usr/local/Cellar/ytalk/*/libexec/bin/python3.12 2>/dev/null | sort -V | tail -1)"
 
 if [[ ! -x "$BREW_PY" ]]; then
   echo "Could not find brew-installed Python at: $BREW_PY" >&2
