@@ -13,6 +13,17 @@
 
 ---
 
+<table>
+  <tr>
+    <td align="center"><img src="assets/tui-idle.png" alt="Setup" /><br/><sub>Paste a YouTube URL and pick models</sub></td>
+    <td align="center"><img src="assets/tui-transcript.png" alt="Transcript" /><br/><sub>Whisper transcribes locally</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/tui-summary.png" alt="Summary" /><br/><sub>One-click summary via Ollama</sub></td>
+    <td align="center"><img src="assets/tui-chat.png" alt="Chat" /><br/><sub>Chat about the video</sub></td>
+  </tr>
+</table>
+
 ## What it does
 
 1. **Downloads** audio from any YouTube video (via yt-dlp)
