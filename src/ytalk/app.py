@@ -168,13 +168,25 @@ def transcribe(audio_path: str, whisper_model: str = "base", progress_callback=N
     return text, segments
 
 
+def format_timestamp(seconds: float) -> str:
+    """Seconds -> compact YouTube timestamp: 'M:SS', or 'H:MM:SS' when over an hour."""
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def format_transcript_segments(
     segments: list[dict],
     pause_threshold: float = 1.5,
     max_paragraph_seconds: float = 30.0,
+    timestamp_fmt=None,
 ) -> str:
     """Group Whisper segments into paragraphs on >pause_threshold pauses or every
-    ~max_paragraph_seconds. Each paragraph is prefixed with [mm:ss] markup."""
+    ~max_paragraph_seconds. Each paragraph is prefixed with a timestamp.
+
+    By default the prefix is zero-padded ``[mm:ss]``. Pass ``timestamp_fmt`` (a
+    callable taking seconds) for a different prefix — e.g. ``format_timestamp`` for
+    hour-aware ``[H:MM:SS]`` markers."""
     if not segments:
         return ""
     paragraphs: list[tuple[float, str]] = []
@@ -194,33 +206,50 @@ def format_transcript_segments(
         paragraphs.append((current_start, " ".join(current_texts)))
     lines = []
     for start, text in paragraphs:
-        mm, ss = divmod(int(start), 60)
-        lines.append(f"[{mm:02d}:{ss:02d}] {text}")
+        if timestamp_fmt is not None:
+            lines.append(f"[{timestamp_fmt(start)}] {text}")
+        else:
+            mm, ss = divmod(int(start), 60)
+            lines.append(f"[{mm:02d}:{ss:02d}] {text}")
     return "\n\n".join(lines)
 
 
-def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, status_callback=None) -> str:
-    """Summarize text using Ollama's API. progress_callback receives accumulated text."""
-    print(f"Summarizing with Ollama model '{model}'...")
-    prompt = (
-        "You are a helpful assistant. Summarize the following transcript concisely. "
-        "Include the key points and main ideas.\n"
-        "Format rules:\n"
-        "- Use markdown headers (##) for sections\n"
-        "- Use dashes (-) for bullet points, not asterisks\n"
-        "- Keep bullet points short (one or two sentences max)\n"
-        "- Use sub-bullets with indentation where needed\n\n"
-        f"TRANSCRIPT:\n{text}\n\n"
-        "SUMMARY:"
-    )
+def _ctx_for(prompt: str, output_headroom: int = 2048, max_ctx: int = 32768) -> int:
+    """Pick a num_ctx that fits the whole prompt plus room to generate.
+
+    Ollama's default context window (4096) silently truncates longer prompts; with the
+    default num_predict that also leaves ~no budget to generate, so a long transcript
+    yields a single token. Size the window to the prompt instead, in power-of-two buckets
+    so the same transcript reuses one loaded model instance.
+    """
+    needed = len(prompt) // 3 + output_headroom  # cheap, slightly conservative token est.
+    ctx = 4096
+    while ctx < needed and ctx < max_ctx:
+        ctx *= 2
+    return min(ctx, max_ctx)
+
+
+def ollama_generate(prompt: str, model: str, progress_callback=None, status_callback=None) -> str:
+    """Stream a completion from Ollama's /api/generate endpoint.
+
+    progress_callback receives the accumulated text after each token. status_callback
+    receives "thinking" once (if the model emits thinking tokens before any output)
+    and "generating" when the first real response token arrives.
+    """
+    import json as _json
+
     resp = requests.post(
         "http://localhost:11434/api/generate",
-        json={"model": model, "prompt": prompt, "stream": True},
+        json={
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"num_ctx": _ctx_for(prompt), "num_predict": -1},
+        },
         timeout=(10, None),
         stream=True,
     )
     resp.raise_for_status()
-    import json as _json
     accumulated = ""
     thinking = True
     thinking_notified = False
@@ -243,6 +272,56 @@ def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, statu
             if progress_callback:
                 progress_callback(accumulated)
     return accumulated.strip()
+
+
+def summarize(text: str, model: str = "gemma3:4b", progress_callback=None, status_callback=None) -> str:
+    """Summarize text using Ollama's API. progress_callback receives accumulated text."""
+    print(f"Summarizing with Ollama model '{model}'...")
+    prompt = (
+        "You are a helpful assistant. Summarize the following transcript concisely. "
+        "Include the key points and main ideas.\n"
+        "Format rules:\n"
+        "- Use markdown headers (##) for sections\n"
+        "- Use dashes (-) for bullet points, not asterisks\n"
+        "- Keep bullet points short (one or two sentences max)\n"
+        "- Use sub-bullets with indentation where needed\n\n"
+        f"TRANSCRIPT:\n{text}\n\n"
+        "SUMMARY:"
+    )
+    return ollama_generate(prompt, model, progress_callback, status_callback)
+
+
+def _clean_chapter_list(text: str) -> str:
+    """Strip stray code fences and blank lines a model may wrap around the list."""
+    lines = [ln.rstrip() for ln in text.strip().splitlines()]
+    lines = [ln for ln in lines if ln.strip() and not ln.strip().startswith("```")]
+    return "\n".join(lines)
+
+
+def generate_timestamps(text: str, model: str = "gemma3:4b", progress_callback=None, status_callback=None) -> str:
+    """Generate YouTube-style chapter timestamps from a timestamped transcript.
+
+    `text` should be a transcript whose paragraphs are prefixed with [M:SS] /
+    [H:MM:SS] markers (see format_transcript_segments + format_timestamp). Returns a
+    bare, newline-separated chapter list ready to paste into a YouTube comment.
+    """
+    print(f"Generating timestamps with Ollama model '{model}'...")
+    prompt = (
+        "You generate YouTube chapter timestamps from a video transcript.\n"
+        "Each transcript paragraph is prefixed with its start time as [M:SS] or [H:MM:SS].\n"
+        "Produce a concise, chronological chapter list to paste into a YouTube comment.\n"
+        "Rules:\n"
+        "- The FIRST line must start at 0:00.\n"
+        "- Use only timestamps that appear in the transcript; never invent times.\n"
+        "- Pick natural topic boundaries; aim for about 5-12 chapters depending on length.\n"
+        "- One chapter per line, EXACTLY: 'M:SS Title' (or 'H:MM:SS Title' past an hour).\n"
+        "- Titles are concise (2-6 words), Title Case, no trailing punctuation.\n"
+        "- Output ONLY the list. No preamble, no commentary, no code fences.\n\n"
+        f"TRANSCRIPT:\n{text}\n\n"
+        "CHAPTERS:"
+    )
+    result = ollama_generate(prompt, model, progress_callback, status_callback)
+    return _clean_chapter_list(result)
 
 
 def chat_query(transcript: str, question: str, history: list[dict], model: str, progress_callback=None) -> str:
@@ -268,7 +347,7 @@ def chat_query(transcript: str, question: str, history: list[dict], model: str, 
             "messages": messages,
             "stream": True,
             "think": False,
-            "options": {"num_predict": -1},
+            "options": {"num_ctx": _ctx_for(system_prompt + question), "num_predict": -1},
         },
         timeout=(10, None),
         stream=True,
@@ -472,12 +551,27 @@ class YTalkApp(App):
         border: solid $primary;
         padding: 1;
     }
+
+    /* Timestamps */
+    #timestamps-actions {
+        height: 3;
+        margin-bottom: 1;
+    }
+    #timestamps-actions Button {
+        margin-right: 1;
+    }
+    #timestamps-md {
+        height: 1fr;
+        border: solid $primary;
+        padding: 1;
+    }
     """
 
     TITLE = "yTalk"
 
     _transcript: str = ""
     _summary: str = ""
+    _timestamps: str = ""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -528,6 +622,12 @@ class YTalkApp(App):
                     yield Button("Copy", id="summary-copy", disabled=True)
                     yield Button("Save", id="summary-save", disabled=True)
                 yield Markdown("", id="summary-md")
+            with TabPane("🔒 Timestamps", id="tab-timestamps", disabled=True):
+                with Horizontal(id="timestamps-actions"):
+                    yield Button("Generate", id="timestamps-btn", variant="primary", disabled=True)
+                    yield Button("Copy", id="timestamps-copy", disabled=True)
+                    yield Button("Save", id="timestamps-save", disabled=True)
+                yield Markdown("", id="timestamps-md")
         yield Label("Status: Idle", id="status-bar")
         yield Footer()
 
@@ -545,8 +645,15 @@ class YTalkApp(App):
         self._thinking_handle = None
         self._thinking_tick = 0
         self._summary_thinking_handle = None
+        self._timestamps_buf: str = ""
+        self._timestamps_lock = threading.Lock()
+        self._timestamps_flush_handle = None
+        self._timestamps_thinking_handle = None
+        self._status_spinner_handle = None
+        self._status_spinner_base = ""
+        self._status_spinner_tick = 0
         tabs = self.query_one(TabbedContent)
-        for tid in ("tab-transcript", "tab-chat", "tab-summary"):
+        for tid in ("tab-transcript", "tab-chat", "tab-summary", "tab-timestamps"):
             tabs.get_tab(tid).tooltip = "Run the pipeline first"
         self._load_ollama_models()
 
@@ -599,6 +706,13 @@ class YTalkApp(App):
             self._copy_to_clipboard(self._summary, "Summary")
         elif bid == "summary-save" and self._summary:
             self._save_to_file("summary", self._summary)
+        elif bid == "timestamps-btn":
+            if self._transcript:
+                self._run_timestamps()
+        elif bid == "timestamps-copy" and self._timestamps:
+            self._copy_to_clipboard(self._timestamps, "Timestamps")
+        elif bid == "timestamps-save" and self._timestamps:
+            self._save_to_file("timestamps", self._timestamps)
 
     def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
         if not self.query_one("#send-btn", Button).disabled:
@@ -633,6 +747,9 @@ class YTalkApp(App):
         transcript_save = self.query_one("#transcript-save", Button)
         summary_copy = self.query_one("#summary-copy", Button)
         summary_save = self.query_one("#summary-save", Button)
+        timestamps_btn = self.query_one("#timestamps-btn", Button)
+        timestamps_copy = self.query_one("#timestamps-copy", Button)
+        timestamps_save = self.query_one("#timestamps-save", Button)
 
         self.call_from_thread(setattr, btn, "disabled", True)
         self.call_from_thread(setattr, send_btn, "disabled", True)
@@ -641,10 +758,14 @@ class YTalkApp(App):
         self.call_from_thread(setattr, transcript_save, "disabled", True)
         self.call_from_thread(setattr, summary_copy, "disabled", True)
         self.call_from_thread(setattr, summary_save, "disabled", True)
+        self.call_from_thread(setattr, timestamps_btn, "disabled", True)
+        self.call_from_thread(setattr, timestamps_copy, "disabled", True)
+        self.call_from_thread(setattr, timestamps_save, "disabled", True)
 
         # Reset state
         self._transcript = ""
         self._summary = ""
+        self._timestamps = ""
         self._chat_history = []
 
         chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
@@ -655,6 +776,7 @@ class YTalkApp(App):
 
         self.call_from_thread(_clear_chat)
         self.call_from_thread(self.query_one("#summary-md", Markdown).update, "")
+        self.call_from_thread(self.query_one("#timestamps-md", Markdown).update, "")
         self.call_from_thread(self.query_one("#video-meta", Static).update, "Loading…")
 
         try:
@@ -683,6 +805,7 @@ class YTalkApp(App):
                 self.call_from_thread(self._render_transcript, "")
 
                 self.call_from_thread(setattr, summarize_btn, "disabled", False)
+                self.call_from_thread(setattr, timestamps_btn, "disabled", False)
                 self.call_from_thread(setattr, transcript_copy, "disabled", False)
                 self.call_from_thread(setattr, transcript_save, "disabled", False)
 
@@ -694,6 +817,7 @@ class YTalkApp(App):
                     ("tab-transcript", "Transcript"),
                     ("tab-chat", "Chat"),
                     ("tab-summary", "Summary"),
+                    ("tab-timestamps", "Timestamps"),
                 ):
                     tabs.enable_tab(tid)
                     tab = tabs.get_tab(tid)
@@ -727,6 +851,8 @@ class YTalkApp(App):
         if chat_model is Select.BLANK:
             chat_model = "gemma3:4b"
 
+        self._start_status_spinner(f"{chat_model} · generating summary")
+
         summary_md = self.query_one("#summary-md", Markdown)
         self.call_from_thread(summary_md.update, "*Generating summary…*")
 
@@ -747,9 +873,9 @@ class YTalkApp(App):
 
             def _on_summary_status(phase):
                 if phase == "thinking":
-                    self._set_status(f"Status: {chat_model} is thinking…")
+                    self._set_status_spinner_base(f"{chat_model} · thinking")
                 else:
-                    self._set_status(f"Status: {chat_model} is generating summary…")
+                    self._set_status_spinner_base(f"{chat_model} · generating summary")
 
             result = summarize(
                 self._transcript, chat_model,
@@ -760,6 +886,7 @@ class YTalkApp(App):
             self.call_from_thread(self._stop_summary_thinking)
             self.call_from_thread(self._flush_summary)
             self.call_from_thread(summary_md.update, self._summary)
+            self._stop_status_spinner()
             self._set_status("Status: Summary ready!")
         except Exception as e:
             self._report_error("summarize", e)
@@ -795,6 +922,102 @@ class YTalkApp(App):
             self._summary_thinking_handle.stop()
             self._summary_thinking_handle = None
 
+    @work(thread=True)
+    def _run_timestamps(self) -> None:
+        timestamps_btn = self.query_one("#timestamps-btn", Button)
+        copy_btn = self.query_one("#timestamps-copy", Button)
+        save_btn = self.query_one("#timestamps-save", Button)
+        self.call_from_thread(setattr, timestamps_btn, "disabled", True)
+        self.call_from_thread(setattr, copy_btn, "disabled", True)
+        self.call_from_thread(setattr, save_btn, "disabled", True)
+
+        def _switch_to_timestamps():
+            self.query_one(TabbedContent).active = "tab-timestamps"
+
+        self.call_from_thread(_switch_to_timestamps)
+
+        chat_model = self.query_one("#chat-select", Select).value
+        if chat_model is Select.BLANK:
+            chat_model = "gemma3:4b"
+
+        self._start_status_spinner(f"{chat_model} · generating timestamps")
+
+        timestamps_md = self.query_one("#timestamps-md", Markdown)
+        self.call_from_thread(timestamps_md.update, "*Generating timestamps…*")
+
+        with self._timestamps_lock:
+            self._timestamps_buf = ""
+
+        def _start_timers():
+            self._timestamps_flush_handle = self.set_interval(0.05, self._flush_timestamps)
+            self._thinking_tick = 0
+            self._timestamps_thinking_handle = self.set_interval(0.4, self._tick_thinking_timestamps)
+
+        self.call_from_thread(_start_timers)
+
+        try:
+            transcript_input = (
+                format_transcript_segments(self._transcript_segments, timestamp_fmt=format_timestamp)
+                if self._transcript_segments
+                else self._transcript
+            )
+
+            def _on_timestamps_token(text):
+                with self._timestamps_lock:
+                    self._timestamps_buf = text
+
+            def _on_timestamps_status(phase):
+                if phase == "thinking":
+                    self._set_status_spinner_base(f"{chat_model} · thinking")
+                else:
+                    self._set_status_spinner_base(f"{chat_model} · generating timestamps")
+
+            result = generate_timestamps(
+                transcript_input, chat_model,
+                progress_callback=_on_timestamps_token,
+                status_callback=_on_timestamps_status,
+            )
+            self._timestamps = result.strip()
+            self.call_from_thread(self._stop_timestamps_thinking)
+            self.call_from_thread(self._flush_timestamps)
+            if self._timestamps:
+                self.call_from_thread(timestamps_md.update, f"```text\n{self._timestamps}\n```")
+            self._stop_status_spinner()
+            self._set_status("Status: Timestamps ready! Copy and paste into a YouTube comment.")
+        except Exception as e:
+            self._report_error("timestamps", e)
+        finally:
+            self.call_from_thread(self._stop_timestamps_thinking)
+            if self._timestamps_flush_handle is not None:
+                handle = self._timestamps_flush_handle
+                self._timestamps_flush_handle = None
+                self.call_from_thread(handle.stop)
+            self.call_from_thread(setattr, timestamps_btn, "disabled", False)
+            if self._timestamps:
+                self.call_from_thread(setattr, copy_btn, "disabled", False)
+                self.call_from_thread(setattr, save_btn, "disabled", False)
+
+    def _flush_timestamps(self) -> None:
+        with self._timestamps_lock:
+            buf = self._timestamps_buf
+        if buf:
+            self.query_one("#timestamps-md", Markdown).update(f"```text\n{buf}\n```")
+
+    def _tick_thinking_timestamps(self) -> None:
+        with self._timestamps_lock:
+            has_buf = bool(self._timestamps_buf)
+        if has_buf:
+            self._stop_timestamps_thinking()
+            return
+        self._thinking_tick += 1
+        dots = "." * (1 + (self._thinking_tick % 3))
+        self.query_one("#timestamps-md", Markdown).update(f"*Generating timestamps{dots}*")
+
+    def _stop_timestamps_thinking(self) -> None:
+        if self._timestamps_thinking_handle is not None:
+            self._timestamps_thinking_handle.stop()
+            self._timestamps_thinking_handle = None
+
     def _send_chat(self, question: str) -> None:
         chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
         user_msg = Static(
@@ -815,11 +1038,12 @@ class YTalkApp(App):
     def _run_chat_query(self, question: str) -> None:
         send_btn = self.query_one("#send-btn", Button)
         self.call_from_thread(setattr, send_btn, "disabled", True)
-        self._set_status("Status: Thinking…")
 
         chat_model = self.query_one("#chat-select", Select).value
         if chat_model is Select.BLANK:
             chat_model = "gemma3:4b"
+
+        self._start_status_spinner(f"{chat_model} · answering")
 
         with self._stream_lock:
             self._streaming_buf = ""
@@ -847,6 +1071,7 @@ class YTalkApp(App):
                 msg = self._streaming_msg
                 self.call_from_thread(msg.update, answer)
                 self.call_from_thread(msg.remove_class, "streaming")
+            self._stop_status_spinner()
             self._set_status("Status: Done! Ask another question.")
         except Exception as e:
             self._report_error("chat", e)
@@ -960,7 +1185,45 @@ class YTalkApp(App):
         label = self.query_one("#status-bar", Label)
         self.call_from_thread(label.update, text)
 
+    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def _start_status_spinner(self, base: str) -> None:
+        """Show an animated working indicator in the global status bar until stopped.
+
+        Call from a worker thread (uses call_from_thread). The base text is shown
+        followed by a cycling spinner frame; use _set_status_spinner_base to change
+        the text on a phase change, and _stop_status_spinner when done.
+        """
+        def _start():
+            self._status_spinner_base = base
+            self._status_spinner_tick = 0
+            if self._status_spinner_handle is None:
+                self._status_spinner_handle = self.set_interval(0.1, self._tick_status_spinner)
+            self._tick_status_spinner()
+
+        self.call_from_thread(_start)
+
+    def _set_status_spinner_base(self, base: str) -> None:
+        """Update the spinner's base text (e.g. on a phase change) while it keeps animating."""
+        self.call_from_thread(setattr, self, "_status_spinner_base", base)
+
+    def _tick_status_spinner(self) -> None:
+        frame = self._SPINNER_FRAMES[self._status_spinner_tick % len(self._SPINNER_FRAMES)]
+        self._status_spinner_tick += 1
+        self.query_one("#status-bar", Label).update(f"Status: {self._status_spinner_base} {frame}")
+
+    def _stop_status_spinner(self) -> None:
+        """Stop the status-bar animation. Blocks until the timer is cancelled, so the
+        next status message written after this call won't be overwritten by a tick."""
+        def _stop():
+            if self._status_spinner_handle is not None:
+                self._status_spinner_handle.stop()
+                self._status_spinner_handle = None
+
+        self.call_from_thread(_stop)
+
     def _report_error(self, where: str, exc: BaseException) -> None:
+        self._stop_status_spinner()
         logger.exception("%s failed", where)
         self._set_status(
             f"Error in {where}: {type(exc).__name__}: {exc}  (see {LOG_PATH})"
