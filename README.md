@@ -39,6 +39,7 @@ Everything runs locally on your machine. No API keys, no cloud services, no data
 - Multiple Whisper model sizes (tiny, base, small, large)
 - Auto-detects available Ollama models
 - One-click summarization of transcripts
+- One-click YouTube chapter timestamps, ready to paste into a comment
 - Multi-turn chat with full conversation history
 - Save transcripts and summaries to file
 
@@ -56,6 +57,36 @@ Then start Ollama and pull a chat model:
 brew services start ollama
 ollama pull gemma3:4b
 ```
+
+### Upgrading
+
+```bash
+brew trust tommysusanto/tap   # one-time on Homebrew 5.1.15+ (see below)
+brew upgrade ytalk
+```
+
+### Homebrew tap trust (5.1.15+)
+
+As of [Homebrew 5.1.15](https://github.com/Homebrew/brew/releases/tag/5.1.15) (June 2026), Homebrew no longer loads a third-party tap's formulae until you explicitly trust the tap — a new [tap-trust security feature](https://github.com/Homebrew/brew/pull/22470). Once Homebrew updates itself to 5.1.15+ you may see:
+
+```
+Error: Refusing to load formula tommysusanto/tap/ytalk from untrusted tap.
+```
+
+This is a Homebrew change, not specific to yTalk. What to do:
+
+- **Fresh install** — `brew install tommysusanto/tap/ytalk` keeps working as-is; a fully-qualified formula name is exempt from the check.
+- **Upgrades** — `brew upgrade ytalk`, `brew outdated`, and bare `brew upgrade` load the tap, so trust it once:
+
+  ```bash
+  brew trust tommysusanto/tap
+  ```
+
+  Or trust only this formula: `brew trust --formula tommysusanto/tap/ytalk`.
+
+- **Opt out during the transition** (not recommended; the flag is temporary): `export HOMEBREW_NO_REQUIRE_TAP_TRUST=1`.
+
+Explicit trust becomes the default in Homebrew 5.2.0 / 6.0.0. Details: [docs.brew.sh/Tap-Trust](https://docs.brew.sh/Tap-Trust).
 
 ### Install from source
 
