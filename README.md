@@ -62,8 +62,15 @@ ollama pull gemma3:4b
 
 ```bash
 brew trust tommysusanto/tap   # one-time on Homebrew 5.1.15+ (see below)
+brew update                   # fetch the latest formula from the tap
 brew upgrade ytalk
 ```
+
+`brew update` is required, not optional: `brew upgrade` compares against the
+formula already cached on disk and never fetches new tap commits on its own. Skip
+it and brew reports `tommysusanto/tap/ytalk X.Y.Z already installed` even when a
+newer release exists. `brew update` pulls the new formula; then `brew upgrade`
+sees it and installs it.
 
 ### Homebrew tap trust (5.1.15+)
 
