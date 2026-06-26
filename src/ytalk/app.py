@@ -546,10 +546,13 @@ class YTalkApp(App):
     #summary-actions Button {
         margin-right: 1;
     }
-    #summary-md {
+    #summary-scroll {
         height: 1fr;
         border: solid $primary;
         padding: 1;
+    }
+    #summary-md {
+        height: auto;
     }
 
     /* Timestamps */
@@ -560,10 +563,13 @@ class YTalkApp(App):
     #timestamps-actions Button {
         margin-right: 1;
     }
-    #timestamps-md {
+    #timestamps-scroll {
         height: 1fr;
         border: solid $primary;
         padding: 1;
+    }
+    #timestamps-md {
+        height: auto;
     }
     """
 
@@ -621,13 +627,15 @@ class YTalkApp(App):
                     yield Button("Generate", id="summarize-btn", variant="primary", disabled=True)
                     yield Button("Copy", id="summary-copy", disabled=True)
                     yield Button("Save", id="summary-save", disabled=True)
-                yield Markdown("", id="summary-md")
+                with VerticalScroll(id="summary-scroll"):
+                    yield Markdown("", id="summary-md")
             with TabPane("🔒 Timestamps", id="tab-timestamps", disabled=True):
                 with Horizontal(id="timestamps-actions"):
                     yield Button("Generate", id="timestamps-btn", variant="primary", disabled=True)
                     yield Button("Copy", id="timestamps-copy", disabled=True)
                     yield Button("Save", id="timestamps-save", disabled=True)
-                yield Markdown("", id="timestamps-md")
+                with VerticalScroll(id="timestamps-scroll"):
+                    yield Markdown("", id="timestamps-md")
         yield Label("Status: Idle", id="status-bar")
         yield Footer()
 
