@@ -15,6 +15,7 @@ import base64
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -214,19 +215,181 @@ def format_transcript_segments(
     return "\n\n".join(lines)
 
 
-def _ctx_for(prompt: str, output_headroom: int = 2048, max_ctx: int = 32768) -> int:
+MIN_CTX = 4096
+DEFAULT_MAX_CTX = 32768
+
+# Leave this fraction of the accelerator budget unused. The model weights and KV cache
+# are not the only things on the GPU (compute buffers scale with context too), and
+# overshooting on unified memory is not a soft failure -- see _gpu_memory_budget_bytes.
+_MEM_SAFETY_FRACTION = 0.90
+
+_mem_profile_cache: dict[str, tuple[int, int] | None] = {}
+
+
+def _sysctl_int(name: str) -> int | None:
+    """Read an integer sysctl, or None if it is missing/unreadable."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", name], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return int(out.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _gpu_memory_budget_bytes() -> int | None:
+    """Bytes the accelerator may hold at once, or None if undeterminable.
+
+    On Apple Silicon the GPU shares system RAM, and macOS caps how much of it can be
+    wired down (~75% by default, overridable via iogpu.wired_limit_mb). Wired pages
+    cannot be swapped out, so once the model plus its KV cache exceed that cap the
+    overflow lands in host RAM that the wired allocation has already starved -- the
+    machine thrashes and locks up instead of Ollama failing cleanly. Sizing the
+    context against this budget is what keeps a long transcript from taking the box down.
+    """
+    if sys.platform != "darwin":
+        return None
+    wired_mb = _sysctl_int("iogpu.wired_limit_mb")
+    if wired_mb:  # 0 means "unset, use the default"
+        return wired_mb * 1024 * 1024
+    total = _sysctl_int("hw.memsize")
+    if not total:
+        return None
+    return int(total * 0.75)
+
+
+def _model_memory_profile(model: str) -> tuple[int, int] | None:
+    """(weight_bytes, kv_cache_bytes_per_token) for `model`, or None if unavailable.
+
+    KV bytes/token comes from the model's own architecture metadata:
+    block_count * head_count_kv * (key_length + value_length) * 2 bytes (f16 K and V).
+    """
+    if model in _mem_profile_cache:
+        return _mem_profile_cache[model]
+
+    profile = None
+    try:
+        tags = requests.get("http://localhost:11434/api/tags", timeout=5).json()
+        weights = next(
+            (m.get("size") for m in tags.get("models", []) if m.get("name") == model), None
+        )
+        info = requests.post(
+            "http://localhost:11434/api/show", json={"model": model}, timeout=5
+        ).json().get("model_info", {})
+
+        def _arch(suffix: str):
+            return next((v for k, v in info.items() if k.endswith(suffix)), None)
+
+        blocks = _arch(".block_count")
+        kv_heads = _arch(".attention.head_count_kv")
+        key_len = _arch(".attention.key_length")
+        val_len = _arch(".attention.value_length")
+        if key_len is None or val_len is None:
+            # Models that omit explicit head dims: derive it from embedding width.
+            embed, heads = _arch(".embedding_length"), _arch(".attention.head_count")
+            if embed and heads:
+                key_len = val_len = embed // heads
+        if weights and blocks and kv_heads and key_len and val_len:
+            profile = (int(weights), int(blocks) * int(kv_heads) * (int(key_len) + int(val_len)) * 2)
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        profile = None
+
+    _mem_profile_cache[model] = profile
+    return profile
+
+
+def _memory_capped_ctx(model: str) -> int | None:
+    """Largest num_ctx whose KV cache still fits alongside `model`'s weights.
+
+    None when the budget or the model's shape can't be determined, in which case the
+    caller falls back to sizing on prompt length alone.
+    """
+    budget = _gpu_memory_budget_bytes()
+    profile = _model_memory_profile(model)
+    if not budget or not profile:
+        return None
+    weights, kv_per_token = profile
+    spare = int(budget * _MEM_SAFETY_FRACTION) - weights
+    if spare <= 0:
+        # Weights alone overshoot the budget; nothing we pick here is safe, so ask for
+        # the smallest window and let Ollama do its own (partial-offload) thing.
+        return MIN_CTX
+    ctx = MIN_CTX
+    while ctx * 2 <= DEFAULT_MAX_CTX and (ctx * 2) * kv_per_token <= spare:
+        ctx *= 2
+    return ctx
+
+
+def _memory_warning(model: str) -> str | None:
+    """A user-facing note when `model` is too big for this machine, else None.
+
+    Worth surfacing: the symptom of an oversized model is the whole system paging
+    itself to death, which reads as "my computer froze", not "yTalk picked a bad model".
+    """
+    capped = _memory_capped_ctx(model)
+    if capped is None or capped > MIN_CTX:
+        return None
+    budget = _gpu_memory_budget_bytes()
+    profile = _model_memory_profile(model)
+    if not budget or not profile:
+        return None
+    gb = 1024 ** 3
+    return (
+        f"{model} needs ~{profile[0] / gb:.1f}GB and this machine can devote "
+        f"~{budget / gb:.1f}GB to it, so context is limited to {capped} tokens and long "
+        f"transcripts will be trimmed. A smaller model will answer better here."
+    )
+
+
+def _ctx_for(
+    prompt: str,
+    output_headroom: int = 2048,
+    max_ctx: int = DEFAULT_MAX_CTX,
+    model: str | None = None,
+) -> int:
     """Pick a num_ctx that fits the whole prompt plus room to generate.
 
     Ollama's default context window (4096) silently truncates longer prompts; with the
     default num_predict that also leaves ~no budget to generate, so a long transcript
     yields a single token. Size the window to the prompt instead, in power-of-two buckets
     so the same transcript reuses one loaded model instance.
+
+    When `model` is given, the window is additionally capped to what actually fits in
+    memory beside that model's weights -- a big model on a small machine gets a smaller
+    window rather than one that wires up more memory than the system has.
     """
     needed = len(prompt) // 3 + output_headroom  # cheap, slightly conservative token est.
-    ctx = 4096
+    if model:
+        capped = _memory_capped_ctx(model)
+        if capped:
+            max_ctx = min(max_ctx, capped)
+    ctx = MIN_CTX
     while ctx < needed and ctx < max_ctx:
         ctx *= 2
     return min(ctx, max_ctx)
+
+
+def _fit_prompt(prompt: str, ctx: int, output_headroom: int = 2048, marker: str = "\n\n[... transcript trimmed to fit the context window ...]\n\n") -> str:
+    """Trim the middle of `prompt` so it fits `ctx`, keeping the head and tail.
+
+    Without this, a prompt longer than the (now memory-capped) window is silently
+    truncated by Ollama -- it drops the tail, which is where the instructions and the
+    'SUMMARY:' cue live, so the model answers the wrong question. Cutting the middle
+    ourselves keeps both the task framing and the end of the transcript intact.
+    """
+    budget_chars = max(0, (ctx - output_headroom)) * 3
+    if budget_chars <= 0 or len(prompt) <= budget_chars:
+        return prompt
+    keep = budget_chars - len(marker)
+    if keep <= 0:
+        return prompt[:budget_chars]
+    head = keep * 2 // 3
+    return prompt[:head] + marker + prompt[len(prompt) - (keep - head):]
 
 
 def ollama_generate(prompt: str, model: str, progress_callback=None, status_callback=None) -> str:
@@ -238,13 +401,15 @@ def ollama_generate(prompt: str, model: str, progress_callback=None, status_call
     """
     import json as _json
 
+    ctx = _ctx_for(prompt, model=model)
+    prompt = _fit_prompt(prompt, ctx)
     resp = requests.post(
         "http://localhost:11434/api/generate",
         json={
             "model": model,
             "prompt": prompt,
             "stream": True,
-            "options": {"num_ctx": _ctx_for(prompt), "num_predict": -1},
+            "options": {"num_ctx": ctx, "num_predict": -1},
         },
         timeout=(10, None),
         stream=True,
@@ -336,6 +501,16 @@ def chat_query(transcript: str, question: str, history: list[dict], model: str, 
         f"TRANSCRIPT:\n{transcript}"
     )
 
+    # Size against everything actually sent -- prior turns count toward the window too,
+    # so a long chat on a long transcript is the worst case, not the first question.
+    history_chars = sum(len(m.get("content", "")) for m in history)
+    ctx = _ctx_for(system_prompt + question + "x" * history_chars, model=model)
+    # Trim the transcript rather than the conversation: the running chat is what the
+    # user can see, so silently dropping it is more surprising than trimming the source.
+    system_prompt = _fit_prompt(
+        system_prompt, ctx, output_headroom=2048 + (len(question) + history_chars) // 3
+    )
+
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": question})
@@ -347,7 +522,7 @@ def chat_query(transcript: str, question: str, history: list[dict], model: str, 
             "messages": messages,
             "stream": True,
             "think": False,
-            "options": {"num_ctx": _ctx_for(system_prompt + question), "num_predict": -1},
+            "options": {"num_ctx": ctx, "num_predict": -1},
         },
         timeout=(10, None),
         stream=True,
@@ -858,6 +1033,11 @@ class YTalkApp(App):
         chat_model = self.query_one("#chat-select", Select).value
         if chat_model is Select.BLANK:
             chat_model = "gemma3:4b"
+
+        warning = _memory_warning(chat_model)
+        if warning:
+            logger.warning("memory: %s", warning)
+            self._set_status(f"Status: {warning}")
 
         self._start_status_spinner(f"{chat_model} · generating summary")
 
