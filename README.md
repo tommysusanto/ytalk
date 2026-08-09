@@ -58,6 +58,26 @@ brew services start ollama
 ollama pull gemma3:4b
 ```
 
+### Choosing a chat model
+
+Ollama runs models entirely in memory, so the model has to fit the machine. On Apple
+Silicon the GPU can use roughly 75% of system RAM, and a model needs about its download
+size (`ollama list`) for weights, plus a context window on top of that.
+
+A good rule of thumb is to pick a model whose download size is under half your RAM. On a
+24 GB Mac, `gemma3:4b` (3.3 GB) and `gemma4:e4b` (9.6 GB) are comfortable; a 30B model
+(~18 GB) is not.
+
+yTalk sizes the context window to the transcript, but caps it at what still fits beside
+the model's weights. If the model you picked is too big for the machine, the status bar
+says so, the window falls back to 4096 tokens, and long transcripts are trimmed to fit —
+summary and chat still work, they just see less of the video. A smaller model that fits
+will give better answers than a larger one that doesn't.
+
+This cap is worth having: GPU memory on Apple Silicon is wired and cannot be swapped out,
+so a model that overshoots the budget pushes the rest of the system into swap and can lock
+the machine up rather than failing cleanly.
+
 ### Upgrading
 
 ```bash
@@ -165,6 +185,7 @@ ytalk/
 │   ├── __init__.py      # Package version
 │   └── app.py           # TUI app, CLI, and pipeline logic
 ├── tests/
+│   ├── test_ctx_for.py  # Context sizing and memory-cap unit tests
 │   └── test_tui.py      # Headless TUI integration test
 ├── Formula/
 │   └── ytalk.rb         # Homebrew formula (template)
@@ -175,10 +196,11 @@ ytalk/
 
 Changes to `src/ytalk/` take effect immediately (editable install). No need to reinstall.
 
-Run the integration test:
+Run the tests:
 
 ```bash
-python tests/test_tui.py
+python tests/test_ctx_for.py   # unit tests; offline, no Ollama needed
+python tests/test_tui.py       # integration test; downloads a real video
 ```
 
 ## License
