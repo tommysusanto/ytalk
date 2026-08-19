@@ -3,8 +3,8 @@ class Ytalk < Formula
 
   desc "Download YouTube videos, transcribe with Whisper, and chat with Ollama"
   homepage "https://github.com/tommysusanto/ytalk"
-  url "https://github.com/tommysusanto/ytalk/archive/refs/tags/v0.3.3.tar.gz"
-  sha256 "a09ccc4dd45f47ac1b23a43800975e8007bb6ee6ca950a62e5c569ee6ed28eb7"
+  url "https://github.com/tommysusanto/ytalk/archive/refs/tags/v0.3.4.tar.gz"
+  sha256 "eb9c031cce9a8c03bdf7461ab6d43597fd1088389948a39cec9e9cdf5dd16469"
   license "MIT"
 
   depends_on "deno"
