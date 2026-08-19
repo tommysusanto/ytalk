@@ -3,10 +3,11 @@ class Ytalk < Formula
 
   desc "Download YouTube videos, transcribe with Whisper, and chat with Ollama"
   homepage "https://github.com/tommysusanto/ytalk"
-  url "https://github.com/tommysusanto/ytalk/archive/refs/tags/v0.3.2.tar.gz"
-  sha256 "80bd82f6dfb0d300ca5d73a33e16dc0a80686c756f88abc25d28954cbce8359e"
+  url "https://github.com/tommysusanto/ytalk/archive/refs/tags/v0.3.3.tar.gz"
+  sha256 "a09ccc4dd45f47ac1b23a43800975e8007bb6ee6ca950a62e5c569ee6ed28eb7"
   license "MIT"
 
+  depends_on "deno"
   depends_on "ffmpeg"
   depends_on :macos
   depends_on "ollama"
@@ -207,8 +208,8 @@ class Ytalk < Formula
   end
 
   resource "yt-dlp" do
-    url "https://files.pythonhosted.org/packages/cd/13/5093bcb954878e50f7217fd2ab94282b53934022e4e4a03265582da83bf5/yt_dlp-2026.3.17-py3-none-any.whl"
-    sha256 "32992db94303a8a5d211a183f2174834fe7f8c29d83ed2e7a324eae97a8f26d8"
+    url "https://files.pythonhosted.org/packages/f9/8a/cd4c9b02c10c563adfe78118310129641900e1cd6de888cfae2452072696/yt_dlp-2026.7.4-py3-none-any.whl"
+    sha256 "f11f2b11d5a8ac4059f9bdf29fa4407dc7c6bb00c5097e95ca22a7a9db518266"
   end
 
   def install
