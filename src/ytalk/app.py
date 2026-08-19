@@ -104,6 +104,29 @@ def find_js_runtime() -> str | None:
     return None
 
 
+class _YdlLogger:
+    """Route yt-dlp's output to the log file instead of the terminal.
+
+    yt-dlp writes to stderr, which ``quiet`` does not cover and which corrupts
+    the Textual display. It also reports a failed attempt as ERROR even when a
+    later client in the ladder succeeds, so its errors are logged at warning
+    level -- download_audio raises if the whole ladder fails, and that is the
+    only failure the user should hear about.
+    """
+
+    def debug(self, msg):
+        logger.debug("yt-dlp: %s", msg)
+
+    def info(self, msg):
+        logger.info("yt-dlp: %s", msg)
+
+    def warning(self, msg):
+        logger.warning("yt-dlp: %s", msg)
+
+    def error(self, msg):
+        logger.warning("yt-dlp (recoverable): %s", msg)
+
+
 def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[str, dict]:
     """Download audio from YouTube using yt-dlp Python API.
 
@@ -132,6 +155,7 @@ def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[s
         # quiet doesn't cover the progress bar, and writing it to stdout garbles
         # the TUI. _progress_hook feeds the status line instead.
         "noprogress": True,
+        "logger": _YdlLogger(),
         "progress_hooks": [_progress_hook],
         # Fetches (and caches) the EJS challenge-solver scripts that the JS
         # runtime runs. Without them every format 403s.

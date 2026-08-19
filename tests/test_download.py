@@ -3,6 +3,7 @@
 Usage:
     PYTHONPATH=src python tests/test_download.py
 """
+import logging
 import os
 import tempfile
 
@@ -149,6 +150,34 @@ def test_partial_files_are_not_mistaken_for_audio():
         assert audio.endswith("audio.webm"), audio
 
 
+def test_ytdlp_output_is_routed_to_the_log():
+    """yt-dlp must never write to the terminal -- stderr corrupts the Textual UI."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_download([None], tmpdir)
+    ydl_logger = FakeYDL.calls[0]["logger"]
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append((record.levelno, record.getMessage()))
+
+    handler = Capture()
+    app.logger.addHandler(handler)
+    try:
+        ydl_logger.error("unable to download video data: HTTP Error 403: Forbidden")
+        ydl_logger.warning("po token missing")
+    finally:
+        app.logger.removeHandler(handler)
+
+    levels = [lvl for lvl, _ in records]
+    # A 403 on one attempt is recovered by the next client, so it must not be
+    # logged as an error -- download_audio raises if the whole ladder fails.
+    assert logging.ERROR not in levels, records
+    assert levels == [logging.WARNING, logging.WARNING], records
+    assert "403" in records[0][1]
+
+
 def test_find_js_runtime():
     """Detection prefers the first name in JS_RUNTIMES that is on PATH."""
     import shutil
@@ -173,6 +202,7 @@ def main():
     test_missing_js_runtime_is_reported()
     test_exhausted_fallbacks_reraise_ytdlp_error()
     test_partial_files_are_not_mistaken_for_audio()
+    test_ytdlp_output_is_routed_to_the_log()
     test_find_js_runtime()
     print("PASS: download fallbacks, JS-runtime detection, and audio-file selection")
 
