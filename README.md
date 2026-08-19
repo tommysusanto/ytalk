@@ -49,7 +49,10 @@ Everything runs locally on your machine. No API keys, no cloud services, no data
 brew install tommysusanto/tap/ytalk
 ```
 
-This pulls in Python, ffmpeg, and Ollama as dependencies automatically.
+This pulls in Python, ffmpeg, Deno, and Ollama as dependencies automatically.
+Deno is there because YouTube now only serves media to players that solve a
+JavaScript challenge — yt-dlp needs a JS runtime to do that. See
+[Download fails with HTTP Error 403](#download-fails-with-http-error-403).
 
 Then start Ollama and pull a chat model:
 
@@ -125,7 +128,30 @@ cd ytalk
 pip install -e .
 ```
 
-Requires Python 3.11+, ffmpeg, and Ollama installed separately.
+Requires Python 3.11+, ffmpeg, Ollama, and a JavaScript runtime (Deno, Node, or
+Bun) installed separately.
+
+### Download fails with HTTP Error 403
+
+```
+Error in download/transcribe: DownloadError: ERROR: unable to download video
+data: HTTP Error 403: Forbidden
+```
+
+YouTube only hands out media URLs to players that solve its JavaScript "n"
+challenge, so yt-dlp needs a JS runtime on your `PATH`:
+
+```bash
+brew install deno
+```
+
+Node and Bun work too — yTalk uses whichever it finds first. If a download still
+fails after that, yt-dlp itself has likely fallen behind YouTube; upgrade yTalk
+(`brew update && brew upgrade ytalk`) to pick up a newer yt-dlp.
+
+Without a proof-of-origin token, YouTube also withholds the small audio-only
+streams, so yTalk falls back to a combined video+audio stream. Downloads are
+larger than they used to be; the audio it extracts is the same.
 
 ## Usage
 

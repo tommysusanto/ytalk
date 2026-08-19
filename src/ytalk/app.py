@@ -80,6 +80,30 @@ def _init_logger() -> logging.Logger:
 logger = _init_logger()
 
 
+# JS runtimes yt-dlp can drive to solve YouTube's challenges, best first.
+JS_RUNTIMES = ("deno", "node", "bun")
+
+JS_RUNTIME_HINT = "No JavaScript runtime found. Install: brew install deno"
+
+# YouTube only hands out media URLs to players that solve its JavaScript "n"
+# challenge. yt-dlp's default client (android_vr) skips the challenge but its
+# URLs now 403, so we retry with clients that do solve it. Which clients YouTube
+# honours changes often, hence a ladder rather than a single choice. None means
+# "whatever yt-dlp defaults to" -- cheapest, and right again whenever upstream
+# catches up.
+PLAYER_CLIENT_FALLBACKS = (None, "tv_simply,web_safari", "mweb,web")
+
+
+def find_js_runtime() -> str | None:
+    """Return the first JS runtime on PATH that yt-dlp can use, else None."""
+    import shutil
+
+    for runtime in JS_RUNTIMES:
+        if shutil.which(runtime):
+            return runtime
+    return None
+
+
 def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[str, dict]:
     """Download audio from YouTube using yt-dlp Python API.
 
@@ -105,12 +129,42 @@ def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[s
         "outtmpl": output_path,
         "noplaylist": True,
         "quiet": True,
+        # quiet doesn't cover the progress bar, and writing it to stdout garbles
+        # the TUI. _progress_hook feeds the status line instead.
+        "noprogress": True,
         "progress_hooks": [_progress_hook],
+        # Fetches (and caches) the EJS challenge-solver scripts that the JS
+        # runtime runs. Without them every format 403s.
+        "remote_components": ["ejs:github"],
     }
     print(f"Downloading audio from: {url}")
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        ydl.download([url])
+
+    info = None
+    last_error = None
+    for attempt, player_client in enumerate(PLAYER_CLIENT_FALLBACKS):
+        opts = dict(ydl_opts)
+        if player_client:
+            opts["extractor_args"] = {"youtube": {"player_client": player_client.split(",")}}
+            if progress_callback:
+                progress_callback(f"Status: Retrying download (player: {player_client})...")
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            break
+        except yt_dlp.utils.DownloadError as e:
+            last_error = e
+            logger.warning(
+                "download: attempt %d/%d failed (player_client=%s): %s",
+                attempt + 1, len(PLAYER_CLIENT_FALLBACKS), player_client or "default", e,
+            )
+
+    if info is None:
+        if find_js_runtime() is None:
+            raise RuntimeError(
+                f"{JS_RUNTIME_HINT} — YouTube requires one to unlock video downloads. "
+                f"Last yt-dlp error: {last_error}"
+            )
+        raise last_error
 
     meta = {
         "title": info.get("title") or "Unknown title",
@@ -121,8 +175,9 @@ def download_audio(url: str, output_dir: str, progress_callback=None) -> tuple[s
 
     audio_file = os.path.join(output_dir, "audio.mp3")
     if not os.path.exists(audio_file):
-        for f in os.listdir(output_dir):
-            if f.startswith("audio."):
+        for f in sorted(os.listdir(output_dir)):
+            # .part/.ytdl leftovers from a failed attempt are not playable audio.
+            if f.startswith("audio.") and not f.endswith((".part", ".ytdl")):
                 audio_file = os.path.join(output_dir, f)
                 break
     if not os.path.exists(audio_file):
@@ -846,8 +901,11 @@ class YTalkApp(App):
 
         warnings = []
 
-        if not shutil.which("yt-dlp"):
-            warnings.append("yt-dlp not found. Install: brew install yt-dlp")
+        if not shutil.which("ffmpeg"):
+            warnings.append("ffmpeg not found. Install: brew install ffmpeg")
+
+        if find_js_runtime() is None:
+            warnings.append(JS_RUNTIME_HINT)
 
         models = fetch_ollama_models()
         if models is None:
